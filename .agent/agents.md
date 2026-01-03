@@ -336,7 +336,8 @@ When adding or modifying API requests:
 
 ## Future Development & Stretch Goals
 
-- **Interactive Secrets Management**: Prompt the user for API keys at the command line then securely encrypt and store them, decrypting transactionally when needed.
-- **Cleanup Option**: Implement a CLI flag (e.g., `--cleanup`) to delete all DXFs and PDFs from the document after export.
+- **Interactive Secrets Management**: Prompt the user for API keys at the command line then securely encrypt and store them, decrypting transactionally when needed. Perform a startup check to see if the secrets file exists and is readable. 
+- **Cleanup Option**: Implement a CLI flag (e.g., `--cleanup`) to delete all DXFs and PDFs from the document after export. Automatically disable this option if the script is working against an immutable version instead of a workspace.
 - **Workspace vs. Version Parameterization**: Implement a CLI flag (e.g., `--version-id <id>` or `--mode [workspace|version]`) to allow exporting artifacts from immutable document versions (`/v/`) instead of active workspaces (`/w/`). This will require updating the API client to dynamically construct endpoint paths based on the selected mode.
-- **Interactive Workflow**: Add an option to run the script in interactive mode, where the user can select which Documents, Part Studios, and Drawings to export, including what versions or workspaces to export from.
+- **Interactive Workflow**: Add an option to run the script in interactive mode, where the user can select which Documents, Part Studios, and Drawings to export, including what versions or workspaces to export from, destination path for exports, etc. This should also give a reasonable option for surfacing document, workspace and version IDs in a user-friendly way.
+- **Packaged Script**: Use PyInstaller to package the script into a single executable file that can be run on any system with no other dependencies required.
