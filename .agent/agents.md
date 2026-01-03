@@ -336,4 +336,7 @@ When adding or modifying API requests:
 
 ## Future Development & Stretch Goals
 
+- **Interactive Secrets Management**: Prompt the user for API keys at the command line then securely encrypt and store them, decrypting transactionally when needed.
+- **Cleanup Option**: Implement a CLI flag (e.g., `--cleanup`) to delete all DXFs and PDFs from the document after export.
 - **Workspace vs. Version Parameterization**: Implement a CLI flag (e.g., `--version-id <id>` or `--mode [workspace|version]`) to allow exporting artifacts from immutable document versions (`/v/`) instead of active workspaces (`/w/`). This will require updating the API client to dynamically construct endpoint paths based on the selected mode.
+- **Interactive Workflow**: Add an option to run the script in interactive mode, where the user can select which Documents, Part Studios, and Drawings to export, including what versions or workspaces to export from.
