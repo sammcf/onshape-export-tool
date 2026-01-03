@@ -8,7 +8,7 @@ import time
 import zipfile
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union, cast
+from typing import Dict, Any, List, Optional, Union, Callable, TypeVar, cast
 
 # --- Configuration & Constants ---
 API_BASE = "https://cad.onshape.com/api/v12"
@@ -29,6 +29,50 @@ def load_config(path: Union[str, Path] = "config") -> Dict[str, Any]:
     except json.JSONDecodeError as e:
         logging.error(f"Error parsing config JSON: {e}")
         return {}
+
+
+# --- Custom Exceptions ---
+class TranslationError(Exception):
+    """Raised when a translation job fails."""
+    pass
+
+class ElementNotFoundError(Exception):
+    """Raised when an expected element disappears."""
+    pass
+
+
+# --- Generic Polling Infrastructure ---
+T = TypeVar('T')
+
+def poll_until(
+    fetch: Callable[[], Any],
+    predicate: Callable[[Any], Optional[T]],
+    timeout: int = 60,
+    interval: float = 2.0
+) -> T:
+    """Generic polling function.
+    
+    Args:
+        fetch: Function that retrieves fresh data (e.g., API call)
+        predicate: Function that examines data and returns a result when done,
+                   or None to continue polling. May raise exceptions to abort.
+        timeout: Maximum seconds to poll before raising TimeoutError
+        interval: Seconds to wait between fetch calls
+    
+    Returns:
+        The first non-None value returned by predicate
+    
+    Raises:
+        TimeoutError: If timeout exceeded before predicate returns a value
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        data = fetch()
+        result = predicate(data)
+        if result is not None:
+            return result
+        time.sleep(interval)
+    raise TimeoutError(f"Polling timed out after {timeout}s")
 
 class OnshapeClient:
     def __init__(self, access_key: str, secret_key: str, base_url: str = API_BASE):
@@ -133,22 +177,25 @@ class OnshapeClient:
 
     def wait_for_drawing_update(self, did: str, wid: str, eid: str, old_mv: Optional[str], timeout: int = 60) -> str:
         """Poll until the element's microversionId changes, indicating a successful modification."""
-        start_time = time.time()
         logging.info(f"Waiting for drawing {eid} to update (polling microversion)...")
-        while time.time() - start_time < timeout:
+        
+        def fetch():
             elements = self.list_elements(did, wid)
-            element = next((e for e in elements if e['id'] == eid), None)
-            if not element:
-                raise Exception(f"Element {eid} disappeared during modification!")
-            
+            return next((e for e in elements if e['id'] == eid), None)
+        
+        def check_microversion(element):
+            if element is None:
+                raise ElementNotFoundError(f"Element {eid} disappeared during modification!")
             new_mv = element.get('microversionId')
             if new_mv and new_mv != old_mv:
                 logging.info(f"Drawing updated (MV: {new_mv})")
-                # Add a small extra buffer for the drawing app to finish internal rendering
-                time.sleep(2)
                 return new_mv
-            time.sleep(2)
-        raise Exception(f"Timeout waiting for drawing {eid} to update after modification")
+            return None  # Keep polling
+        
+        result = poll_until(fetch, check_microversion, timeout)
+        # Small buffer for drawing app to finish internal rendering
+        time.sleep(2)
+        return result
 
     def delete_element(self, did: str, wid: str, eid: str):
         """Delete an element from the document."""
@@ -179,21 +226,24 @@ class OnshapeClient:
         return cast(str, resp.get('id'))
 
     def poll_translation(self, translation_id: str, timeout: int = 300) -> str:
-        """Poll for translation and return the resulting element ID."""
+        """Poll for translation completion and return the resulting element ID."""
         endpoint = f"/translations/{translation_id}"
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            resp = self._request('GET', endpoint)
+        
+        def fetch():
+            return self._request('GET', endpoint)
+        
+        def check_state(resp):
             state = resp.get('requestState')
             if state == 'DONE':
                 ids = resp.get('resultElementIds', [])
                 if ids:
-                    return cast(str, ids[0])
-                raise Exception("Translation done but no result element IDs found")
+                    return ids[0]
+                raise TranslationError("Translation done but no result element IDs found")
             elif state == 'FAILED':
-                raise Exception(f"Translation failed: {resp.get('failureReason', 'Unknown reason')}")
-            time.sleep(2)
-        raise Exception(f"Translation timed out")
+                raise TranslationError(f"Translation failed: {resp.get('failureReason', 'Unknown reason')}")
+            return None  # Keep polling
+        
+        return poll_until(fetch, check_state, timeout)
 
     def download_blob(self, did: str, wid: str, eid: str, name: str) -> bytes:
         """Download blob content."""
