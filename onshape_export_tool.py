@@ -12,7 +12,7 @@ import time
 import zipfile
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union, Callable, TypeVar, cast
+from typing import Dict, Any, List, Optional, Tuple, Union, Callable, TypeVar, cast
 
 
 # ============================================================
@@ -28,6 +28,9 @@ DEFAULT_TEMPLATE_ELEMENT = "149ce62208ba05ac0cee75e5"
 
 # Prefixes for temporary elements that should be cleaned up
 TEMP_ELEMENT_PREFIXES = ("TEMP_", "DEBUG_VIEW_", "TEST_MV_")
+
+# Type alias for export results: (element_id, filename)
+ExportResult = Tuple[str, str]
 
 
 # ============================================================
@@ -378,7 +381,7 @@ def discover_exportables(
     client: OnshapeClient, 
     did: str, 
     wid: str
-) -> tuple:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Categorize document elements into Part Studios and Drawings.
     
     Returns:
@@ -469,7 +472,7 @@ def export_part_studio(
     did: str,
     wid: str,
     part_studio: Dict[str, Any]
-) -> List[tuple]:
+) -> List[ExportResult]:
     """Export all parts from a Part Studio as DXFs.
     
     Unsuppresses the 'Orient Plates for Export' feature, exports each part,
@@ -523,7 +526,7 @@ def export_drawing_as_pdf(
     did: str,
     wid: str,
     drawing: Dict[str, Any]
-) -> Optional[tuple]:
+) -> Optional[ExportResult]:
     """Export an existing drawing as PDF.
     
     Returns:
@@ -548,7 +551,7 @@ def package_results(
     client: OnshapeClient,
     did: str,
     wid: str,
-    results: List[tuple],
+    results: List[ExportResult],
     output_dir: Path,
     log_entries: List[str]
 ) -> Optional[Path]:
@@ -628,7 +631,7 @@ def run_export_workflow(
         log(f"Found {len(part_studios)} Part Studios, {len(drawings)} drawings")
         
         # Step 3: Export Part Studios → DXF
-        results: List[tuple] = []
+        results: List[ExportResult] = []
         for ps in part_studios:
             ps_results = export_part_studio(client, did, wid, ps)
             results.extend(ps_results)
