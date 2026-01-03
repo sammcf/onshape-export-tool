@@ -346,167 +346,320 @@ def get_element_microversion(client: OnshapeClient, did: str, wid: str, eid: str
 
 
 # ============================================================
-# SECTION 6: Business Logic (Workflow Orchestration)
+# SECTION 6: Business Logic (Workflow Functions)
 # ============================================================
 
-# This section will be refactored in Phase 3.
-# For now, run_full_workflow remains but uses standalone functions.
+# Each function has a single responsibility and can be composed
+# to create different export workflows.
 
-def run_full_workflow(client: OnshapeClient, config: Dict[str, Any], output_dir: Path):
-    """Main workflow: export DXFs from Part Studios and PDFs from Drawings."""
-    did = cast(str, config.get('documentId'))
-    wid = cast(str, config.get('workspaceId'))
+def cleanup_temp_elements(client: OnshapeClient, did: str, wid: str) -> int:
+    """Delete any leftover temporary elements from previous runs.
     
-    if not did or not wid:
-        logging.error("Missing documentId or workspaceId in config")
-        return
+    Returns:
+        Number of elements deleted
+    """
+    elements = list_elements(client, did, wid)
+    temp_elements = [e for e in elements if e.get('name', '').startswith(TEMP_ELEMENT_PREFIXES)]
+    
+    deleted = 0
+    for e in temp_elements:
+        try:
+            delete_element(client, did, wid, e['id'])
+            deleted += 1
+        except Exception as ex:
+            logging.debug(f"Failed to delete leftover {e['id']}: {ex}")
+    
+    if deleted > 0:
+        logging.info(f"Cleaned up {deleted} temporary elements")
+    return deleted
 
-    log_entries: List[str] = []
 
-    def log(msg: str, level: int = logging.INFO):
-        logging.log(level, msg)
-        log_entries.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}")
+def discover_exportables(
+    client: OnshapeClient, 
+    did: str, 
+    wid: str
+) -> tuple:
+    """Categorize document elements into Part Studios and Drawings.
+    
+    Returns:
+        Tuple of (part_studios, drawings) where each is a list of element dicts
+    """
+    elements = list_elements(client, did, wid)
+    
+    part_studios = [e for e in elements if e['elementType'] == 'PARTSTUDIO']
+    drawings = [
+        e for e in elements 
+        if e['elementType'] == 'DRAWING' or 
+        (e['elementType'] == 'APPLICATION' and 'drawing' in e.get('dataType', '').lower())
+    ]
+    
+    # Filter out temp drawings
+    drawings = [d for d in drawings if not d['name'].startswith(TEMP_ELEMENT_PREFIXES)]
+    
+    logging.info(f"Discovered {len(part_studios)} Part Studios and {len(drawings)} drawings")
+    return part_studios, drawings
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    export_results: List[tuple] = []  # List of (eid, filename)
 
+def find_orient_feature(features: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Find the highest-indexed 'Orient Plates for Export' feature.
+    
+    Returns:
+        The feature dict, or None if not found
+    """
+    pattern = re.compile(r"^Orient Plates for Export(?: (\d+))?$")
+    candidates = []
+    
+    for f in features:
+        match = pattern.match(f.get('name', ''))
+        if match:
+            index = int(match.group(1)) if match.group(1) else 0
+            candidates.append((index, f))
+    
+    if not candidates:
+        return None
+    
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def export_part_as_dxf(
+    client: OnshapeClient,
+    did: str,
+    wid: str,
+    part_studio_eid: str,
+    part: Dict[str, Any]
+) -> Optional[str]:
+    """Export a single part as DXF via temporary drawing.
+    
+    Creates a temp drawing, adds a top view, exports to DXF, then cleans up.
+    
+    Returns:
+        Result element ID on success, None on failure
+    """
+    part_id = cast(str, part.get('partId'))
+    part_name = cast(str, part.get('name', 'unnamed_part'))
+    
+    # Create temp drawing
+    temp_name = f"TEMP_{part_name}_{int(time.time())}"
+    temp_drawing_id = create_drawing(client, did, wid, temp_name)
+    old_mv = get_element_microversion(client, did, wid, temp_drawing_id)
+    logging.info(f"Created temp drawing for '{part_name}'")
+    
     try:
-        elements = list_elements(client, did, wid)
+        # Add view and wait for it to render
+        add_view_to_drawing(client, did, wid, temp_drawing_id, part_studio_eid, part_id)
+        wait_for_microversion_change(client, did, wid, temp_drawing_id, old_mv)
         
-        # Pre-flight Cleanup
-        temp_elements = [e for e in elements if e.get('name', '').startswith(TEMP_ELEMENT_PREFIXES)]
-        if temp_elements:
-            log(f"Cleaning up {len(temp_elements)} leftover temporary elements...")
-            for e in temp_elements:
-                try:
-                    delete_element(client, did, wid, e['id'])
-                except Exception as ex:
-                    logging.debug(f"Failed to delete leftover {e['id']}: {ex}")
-            elements = list_elements(client, did, wid)
-
-        # Categorize elements
-        part_studios = [e for e in elements if e['elementType'] == 'PARTSTUDIO']
-        drawings = [e for e in elements if e['elementType'] == 'DRAWING' or 
-                    (e['elementType'] == 'APPLICATION' and 'drawing' in e.get('dataType', '').lower())]
+        # Export to DXF
+        trans_id = initiate_translation(client, did, wid, temp_drawing_id, 'DXF', part_name)
+        result_id = poll_translation(client, trans_id)
+        logging.info(f"Exported '{part_name}' → {result_id}")
+        return result_id
         
-        log(f"Discovered {len(part_studios)} Part Studios and {len(drawings)} drawings.")
+    finally:
+        # Always clean up temp drawing
+        try:
+            delete_element(client, did, wid, temp_drawing_id)
+        except Exception as e:
+            logging.warning(f"Failed to delete temp drawing: {e}")
 
-        # Phase 1: Part Studios → DXF
-        for ps in part_studios:
-            eid = ps['id']
-            log(f"Processing Part Studio: {ps['name']}")
-            
-            features = get_features(client, did, wid, eid)
-            
-            # Find "Orient Plates for Export" feature with highest index
-            feature_pattern = re.compile(r"^Orient Plates for Export(?: (\d+))?$")
-            orient_candidates = []
-            for f in features:
-                match = feature_pattern.match(f.get('name', ''))
-                if match:
-                    num = int(match.group(1)) if match.group(1) else 0
-                    orient_candidates.append((num, f))
-            
-            if not orient_candidates:
-                log(f"No 'Orient Plates for Export' feature found in {ps['name']}. Skipping.")
-                continue
 
-            orient_candidates.sort(key=lambda x: x[0], reverse=True)
-            _, orient_feature = orient_candidates[0]
-            
-            log(f"Unsuppressing feature '{orient_feature.get('name')}'")
-            update_feature_suppression(client, did, wid, eid, orient_feature, False)
-            
+def export_part_studio(
+    client: OnshapeClient,
+    did: str,
+    wid: str,
+    part_studio: Dict[str, Any]
+) -> List[tuple]:
+    """Export all parts from a Part Studio as DXFs.
+    
+    Unsuppresses the 'Orient Plates for Export' feature, exports each part,
+    then re-suppresses the feature.
+    
+    Returns:
+        List of (result_eid, filename) tuples for successful exports
+    """
+    eid = part_studio['id']
+    name = part_studio['name']
+    results = []
+    
+    logging.info(f"Processing Part Studio: {name}")
+    
+    # Find orient feature
+    features = get_features(client, did, wid, eid)
+    orient_feature = find_orient_feature(features)
+    
+    if not orient_feature:
+        logging.info(f"No 'Orient Plates for Export' feature in {name}, skipping")
+        return results
+    
+    # Unsuppress feature
+    logging.info(f"Unsuppressing '{orient_feature.get('name')}'")
+    update_feature_suppression(client, did, wid, eid, orient_feature, False)
+    
+    try:
+        time.sleep(5)  # Allow Part Studio to regenerate
+        parts = list_parts(client, did, wid, eid)
+        logging.info(f"Found {len(parts)} parts in {name}")
+        
+        for part in parts:
+            part_name = part.get('name', 'unnamed_part')
             try:
-                time.sleep(5)  # Allow Part Studio to regenerate
-                parts = list_parts(client, did, wid, eid)
-                log(f"Found {len(parts)} parts in {ps['name']}")
-                
-                for part in parts:
-                    part_id = cast(str, part.get('partId'))
-                    part_name = cast(str, part.get('name', 'unnamed_part'))
-                    
-                    try:
-                        # Create temp drawing
-                        temp_name = f"TEMP_{part_name}_{int(time.time())}"
-                        temp_drawing_id = create_drawing(client, did, wid, temp_name)
-                        old_mv = get_element_microversion(client, did, wid, temp_drawing_id)
-                        log(f"Created temp drawing for {part_name}")
-                        
-                        # Add view and wait for it to render
-                        add_view_to_drawing(client, did, wid, temp_drawing_id, eid, part_id)
-                        wait_for_microversion_change(client, did, wid, temp_drawing_id, old_mv)
-                        
-                        try:
-                            # Export to DXF
-                            trans_id = initiate_translation(client, did, wid, temp_drawing_id, 'DXF', part_name)
-                            result_id = poll_translation(client, trans_id)
-                            log(f"Exported {part_name} → {result_id}")
-                            export_results.append((result_id, f"{part_name}.dxf"))
-                        finally:
-                            # Always delete temp drawing
-                            try:
-                                delete_element(client, did, wid, temp_drawing_id)
-                            except Exception as e:
-                                log(f"Warning: Failed to delete temp drawing: {e}", logging.WARNING)
-                    except Exception as e:
-                        log(f"Error processing part {part_name}: {e}", logging.ERROR)
-                        
-            finally:
-                # Re-suppress feature
-                update_feature_suppression(client, did, wid, eid, orient_feature, True)
-                log(f"Re-suppressed feature '{orient_feature.get('name')}'")
-
-        # Phase 2: Existing Drawings → PDF
-        for dr in drawings:
-            if dr['name'].startswith("TEMP_"):
-                continue
-                
-            log(f"Processing drawing: {dr['name']}")
-            try:
-                trans_id = initiate_translation(client, did, wid, dr['id'], 'PDF', dr['name'])
-                result_id = poll_translation(client, trans_id)
-                log(f"Exported {dr['name']} → {result_id}")
-                export_results.append((result_id, f"{dr['name']}.pdf"))
+                result_id = export_part_as_dxf(client, did, wid, eid, part)
+                if result_id:
+                    results.append((result_id, f"{part_name}.dxf"))
             except Exception as e:
-                log(f"Error exporting drawing {dr['name']}: {e}", logging.ERROR)
-
-        # Phase 3: Download and ZIP
-        if export_results:
-            log(f"Downloading {len(export_results)} files...")
-            zip_name = f"onshape_export_{int(time.time())}.zip"
-            zip_path = output_dir / zip_name
-            
-            with zipfile.ZipFile(zip_path, 'w') as zf:
-                all_elements = list_elements(client, did, wid)
-                element_names = {el['id']: el['name'] for el in all_elements}
-
-                for result_id, filename in export_results:
-                    try:
-                        actual_name = element_names.get(result_id, filename)
-                        if filename.endswith('.dxf') and not actual_name.lower().endswith('.dxf'):
-                            actual_name += '.dxf'
-                        elif filename.endswith('.pdf') and not actual_name.lower().endswith('.pdf'):
-                            actual_name += '.pdf'
-                            
-                        content = download_blob(client, did, wid, result_id)
-                        safe_name = actual_name.replace(' ', '_').replace('/', '_')
-                        zf.writestr(safe_name, content)
-                    except Exception as e:
-                        log(f"Error downloading {result_id}: {e}", logging.ERROR)
+                logging.error(f"Failed to export part '{part_name}': {e}")
                 
-                zf.writestr("export_operation.log", "\n".join(log_entries))
-            
-            log(f"SUCCESS: ZIP created at {zip_path}")
-            print(f"\n--- SUCCESS ---\nZIP file ready: {zip_path}\n")
-        else:
-            log("No files were successfully exported.")
+    finally:
+        # Always re-suppress feature
+        update_feature_suppression(client, did, wid, eid, orient_feature, True)
+        logging.info(f"Re-suppressed '{orient_feature.get('name')}'")
+    
+    return results
 
+
+def export_drawing_as_pdf(
+    client: OnshapeClient,
+    did: str,
+    wid: str,
+    drawing: Dict[str, Any]
+) -> Optional[tuple]:
+    """Export an existing drawing as PDF.
+    
+    Returns:
+        (result_eid, filename) tuple on success, None on failure
+    """
+    name = drawing['name']
+    eid = drawing['id']
+    
+    logging.info(f"Processing drawing: {name}")
+    
+    try:
+        trans_id = initiate_translation(client, did, wid, eid, 'PDF', name)
+        result_id = poll_translation(client, trans_id)
+        logging.info(f"Exported '{name}' → {result_id}")
+        return (result_id, f"{name}.pdf")
     except Exception as e:
-        log(f"CRITICAL: Workflow failed: {e}", logging.ERROR)
-        with open(output_dir / "critical_error.log", "w") as f:
+        logging.error(f"Failed to export drawing '{name}': {e}")
+        return None
+
+
+def package_results(
+    client: OnshapeClient,
+    did: str,
+    wid: str,
+    results: List[tuple],
+    output_dir: Path,
+    log_entries: List[str]
+) -> Optional[Path]:
+    """Download exported files and package them into a ZIP.
+    
+    Returns:
+        Path to ZIP file on success, None if no results
+    """
+    if not results:
+        logging.info("No files to package")
+        return None
+    
+    logging.info(f"Downloading {len(results)} files...")
+    
+    # Get current element names for proper filenames
+    elements = list_elements(client, did, wid)
+    element_names = {el['id']: el['name'] for el in elements}
+    
+    zip_name = f"onshape_export_{int(time.time())}.zip"
+    zip_path = output_dir / zip_name
+    
+    with zipfile.ZipFile(zip_path, 'w') as zf:
+        for result_id, fallback_name in results:
+            try:
+                # Use actual element name if available
+                actual_name = element_names.get(result_id, fallback_name)
+                if fallback_name.endswith('.dxf') and not actual_name.lower().endswith('.dxf'):
+                    actual_name += '.dxf'
+                elif fallback_name.endswith('.pdf') and not actual_name.lower().endswith('.pdf'):
+                    actual_name += '.pdf'
+                
+                content = download_blob(client, did, wid, result_id)
+                safe_name = actual_name.replace(' ', '_').replace('/', '_')
+                zf.writestr(safe_name, content)
+            except Exception as e:
+                logging.error(f"Failed to download {result_id}: {e}")
+        
+        # Include log
+        zf.writestr("export_operation.log", "\n".join(log_entries))
+    
+    logging.info(f"Created ZIP: {zip_path}")
+    return zip_path
+
+
+def run_export_workflow(
+    client: OnshapeClient,
+    did: str,
+    wid: str,
+    output_dir: Path
+) -> Optional[Path]:
+    """Main export workflow orchestrator.
+    
+    Steps:
+    1. Cleanup leftover temp elements
+    2. Discover Part Studios and Drawings
+    3. Export parts from Part Studios as DXFs
+    4. Export Drawings as PDFs
+    5. Package all results into a ZIP
+    
+    Returns:
+        Path to the created ZIP file, or None on failure
+    """
+    log_entries: List[str] = []
+    
+    def log(msg: str):
+        logging.info(msg)
+        log_entries.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}")
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Step 1: Cleanup
+        cleanup_temp_elements(client, did, wid)
+        
+        # Step 2: Discovery
+        part_studios, drawings = discover_exportables(client, did, wid)
+        log(f"Found {len(part_studios)} Part Studios, {len(drawings)} drawings")
+        
+        # Step 3: Export Part Studios → DXF
+        results: List[tuple] = []
+        for ps in part_studios:
+            ps_results = export_part_studio(client, did, wid, ps)
+            results.extend(ps_results)
+            for _, filename in ps_results:
+                log(f"Exported: {filename}")
+        
+        # Step 4: Export Drawings → PDF
+        for dr in drawings:
+            result = export_drawing_as_pdf(client, did, wid, dr)
+            if result:
+                results.append(result)
+                log(f"Exported: {result[1]}")
+        
+        # Step 5: Package
+        zip_path = package_results(client, did, wid, results, output_dir, log_entries)
+        
+        if zip_path:
+            log(f"SUCCESS: {zip_path}")
+            print(f"\n--- SUCCESS ---\nZIP file ready: {zip_path}\n")
+            return zip_path
+        else:
+            log("No files were exported")
+            return None
+            
+    except Exception as e:
+        logging.error(f"Workflow failed: {e}")
+        error_log = output_dir / "critical_error.log"
+        with open(error_log, "w") as f:
             f.write("\n".join(log_entries))
             f.write(f"\nCRITICAL ERROR: {e}")
+        return None
 
 
 # ============================================================
@@ -525,16 +678,24 @@ def main():
     logging.basicConfig(level=log_level, format=LOG_FORMAT)
 
     config = load_config(Path(__file__).parent / "config")
-    access_key = cast(str, config.get('accessKey'))
-    secret_key = cast(str, config.get('secretKey'))
+    
+    # Validate required config
+    access_key = config.get('accessKey')
+    secret_key = config.get('secretKey')
+    did = config.get('documentId')
+    wid = config.get('workspaceId')
 
     if not access_key or not secret_key:
         logging.critical("API credentials missing in config file.")
         return
+    
+    if not did or not wid:
+        logging.critical("Missing documentId or workspaceId in config file.")
+        return
 
     client = OnshapeClient(access_key, secret_key)
     output_path = base_dir / args.out
-    run_full_workflow(client, config, output_path)
+    run_export_workflow(client, did, wid, output_path)
 
 
 if __name__ == "__main__":
