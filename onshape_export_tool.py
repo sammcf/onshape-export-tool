@@ -209,6 +209,7 @@ def save_secrets(secrets: Secrets, path: Path) -> None:
     with open(path, 'w') as f:
         json.dump(encrypted, f, indent=2)
     logging.info(f"Saved encrypted secrets to {path}")
+    print(f"  Note: To change your encryption password, delete {path} and re-run setup.")
 
 
 def prompt_secrets() -> Secrets:
