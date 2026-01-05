@@ -336,10 +336,18 @@ When adding or modifying API requests:
 
 ## Future Development & Stretch Goals
 
-- [HIGH] **Export Rules for Filenames**: Ensure that all exported manufacturing artifacts are saved with the correct file names according to export rules.
+- [DONE] **Export Rules for Filenames**: Ensure that all exported manufacturing artifacts are saved with the correct file names according to export rules.
+- [DONE] **Handle Sheetmetal Parts Correctly**: Ensure that sheetmetal part flat patterns are exported correctly. This will probably require a change to the overall workflow: finding flat patterns and exporting them prior to unsuppressing the orient feature.
+- [DONE] **Handle Part Thickness for Export Rules**: Ensure that part thickness is used correctly in export rules. Given this is a computed property, we may need to radically change our strategy for handling it.
+- [HIGH] **Packaged Script**: Use PyInstaller to package the script into a single executable file that can be run on any system with no other dependencies required.
 - [MEDIUM] **Interactive Secrets Management**: Prompt the user for API keys at the command line then securely encrypt and store them, decrypting transactionally when needed. Perform a startup check to see if the secrets file exists and is readable. 
-- [MEDIUM] **Cleanup Option**: Implement a CLI flag (e.g., `--cleanup`) to delete all DXFs and PDFs from the document after export. Automatically disable this option if the script is working against an immutable version instead of a workspace.
-- [MEDIUM] **Packaged Script**: Use PyInstaller to package the script into a single executable file that can be run on any system with no other dependencies required.
+- [MEDIUM] **Clean Run Option**: Implement a CLI flag (e.g., `--clean`) to delete all DXFs and PDFs from the document both before and after export.  Automatically disable this option if the script is working against an immutable version instead of a workspace. This probably means factoring out a delete_dxf_and_pdf() function to use generally.
 - [LOW] **Workspace vs. Version Parameterization**: Implement a CLI flag (e.g., `--version-id <id>` or `--mode [workspace|version]`) to allow exporting artifacts from immutable document versions (`/v/`) instead of active workspaces (`/w/`). This will require updating the API client to dynamically construct endpoint paths based on the selected mode.
 - [LOW] **Interactive Workflow**: Add an option to run the script in interactive mode, where the user can select which Documents, Part Studios, and Drawings to export, including what versions or workspaces to export from, destination path for exports, etc. This should also give a reasonable option for surfacing document, workspace and version IDs in a user-friendly way.
 - [LOW] **Part Filtering and Orientation**: Investigate if it's possible to bring the plate part filtering and orientation logic over to the API side, or if it should stay as a FeatureScript in Onshape.
+
+## Important Takeaways
+
+- The Onshape REST API is incredibly powerful. Having a local spec and testing setup with Bruno suggests a lot of future possibilities.
+- I erroneously assumed that computed properties would not be available over the wire but *they are* - you just have to query the appropriate metadata endpoint with the right parameters.
+- Lots of refactoring and tidying up opportunities. In fact, a rewrite in go-lang probably wouldn't go astray - this has given me a strong understanding of the data flow and processes.
