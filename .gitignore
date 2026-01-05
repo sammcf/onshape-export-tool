@@ -8,6 +8,11 @@ venv/
 env/
 .env/
 
+# PyInstaller
+build/
+dist/
+*.spec
+
 # Node (standard exclusion)
 node_modules/
 

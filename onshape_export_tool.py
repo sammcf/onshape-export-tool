@@ -5,6 +5,7 @@ Exports DXFs from oriented plate parts and PDFs from existing drawings.
 Uses the Onshape REST API to automate the export workflow.
 """
 import json
+import sys
 import logging
 import argparse
 import requests
@@ -66,6 +67,37 @@ def load_config(path: Union[str, Path] = "config") -> Dict[str, Any]:
     except json.JSONDecodeError as e:
         logging.error(f"Error parsing config JSON: {e}")
         return {}
+
+
+CONFIG_TEMPLATE = """{
+    "accessKey": "YOUR_ACCESS_KEY_HERE",
+    "secretKey": "YOUR_SECRET_KEY_HERE",
+    "documentId": "YOUR_DOCUMENT_ID_HERE",
+    "workspaceId": "YOUR_WORKSPACE_ID_HERE"
+}
+"""
+
+
+def create_config_template(path: Path) -> None:
+    """Create a template config file with placeholder values."""
+    with open(path, 'w') as f:
+        f.write(CONFIG_TEMPLATE)
+    print(f"""
+╔══════════════════════════════════════════════════════════════════╗
+║                    CONFIGURATION REQUIRED                        ║
+╠══════════════════════════════════════════════════════════════════╣
+║  A template config file has been created at:                     ║
+║  {str(path):<60} ║
+║                                                                  ║
+║  Please edit this file and fill in:                              ║
+║    • accessKey    - Your Onshape API access key                  ║
+║    • secretKey    - Your Onshape API secret key                  ║
+║    • documentId   - The document ID to export from               ║
+║    • workspaceId  - The workspace ID to export from              ║
+║                                                                  ║
+║  Then run this tool again.                                       ║
+╚══════════════════════════════════════════════════════════════════╝
+""")
 
 
 def poll_until(
@@ -872,11 +904,25 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
 
-    base_dir = Path(__file__).parent.parent
+    # Determine base directory (works for both script and packaged exe)
+    if getattr(sys, 'frozen', False):
+        # Running as packaged executable
+        base_dir = Path(sys.executable).parent
+    else:
+        # Running as script
+        base_dir = Path(__file__).parent
+    
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format=LOG_FORMAT)
 
-    config = load_config(Path(__file__).parent / "config")
+    config_path = base_dir / "config"
+    
+    # Check if config exists, create template if not
+    if not config_path.exists():
+        create_config_template(config_path)
+        return
+    
+    config = load_config(config_path)
     
     # Validate required config
     access_key = config.get('accessKey')
@@ -884,12 +930,21 @@ def main():
     did = config.get('documentId')
     wid = config.get('workspaceId')
 
-    if not access_key or not secret_key:
-        logging.critical("API credentials missing in config file.")
+    # Check for placeholder values
+    if access_key == "YOUR_ACCESS_KEY_HERE" or not access_key:
+        print("ERROR: Please fill in your Onshape API access key in the config file.")
         return
     
-    if not did or not wid:
-        logging.critical("Missing documentId or workspaceId in config file.")
+    if secret_key == "YOUR_SECRET_KEY_HERE" or not secret_key:
+        print("ERROR: Please fill in your Onshape API secret key in the config file.")
+        return
+    
+    if did == "YOUR_DOCUMENT_ID_HERE" or not did:
+        print("ERROR: Please fill in the document ID in the config file.")
+        return
+    
+    if wid == "YOUR_WORKSPACE_ID_HERE" or not wid:
+        print("ERROR: Please fill in the workspace ID in the config file.")
         return
 
     client = OnshapeClient(access_key, secret_key)
