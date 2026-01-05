@@ -1,124 +1,63 @@
 # Onshape Manufacturing Export Tool
 
-A CLI tool that automates the export of manufacturing artifacts (DXFs and PDFs) from Onshape documents.
+This tool exports DXF files from parts and PDF files from drawings in Onshape.
 
-## Features
+## Instructions for Users
 
-- **Sheet Metal Flat Patterns**: Automatically detects and exports sheet metal flat patterns directly
-- **Plate DXF Export**: Exports oriented plate parts as DXFs (1:1 scale, no bend tangent lines)
-- **PDF Export**: Exports existing drawings as PDFs
-- **Thickness in Filenames**: Prepends part thickness to DXF filenames (e.g., `3mm_PART_NAME.dxf`)
-- **Export Rules Support**: Uses Onshape export rules for filenames when configured
-- **Filename Collision Handling**: Detects duplicate filenames and reports them at end of run
-- **Standalone Executable**: Can be packaged as a single executable with PyInstaller
-- **Auto-Config Template**: Creates a template config file on first run with instructions
+### First Time Setup
 
-## Quick Start
+1. Download the tool for your operating system.
+2. Open a terminal and run the tool with the setup flag:
+   ./onshape_export_tool --setup
+3. Enter your Onshape API keys when prompted.
+4. Enter an encryption password to protect your keys on disk.
+5. Enter the Document ID and Workspace ID of your project.
 
-### Option 1: Standalone Executable
+### Running Exports
 
-1. Download or build the executable (see [Building](#building))
-2. Run it once — a `config` template will be created
-3. Edit the `config` file with your credentials
-4. Run again to export
+Run the tool without flags to export the configured document:
+./onshape_export_tool
 
-### Option 2: Run from Source
+Use the interactive flag to browse and select a different document:
+./onshape_export_tool --interactive
 
-```bash
-# Clone and setup
-git clone https://github.com/sammcf/onshape-export-tool.git
-cd onshape-export-tool
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+### Flags
 
-# Run
-python onshape_export_tool.py
-```
+- --setup: Runs the guided setup process.
+- --interactive: Browse and select documents to export.
+- --out [directory]: Sets the output folder name.
+- --verbose: Shows detailed logs of all operations.
+- --clean-before: Deletes old DXF and PDF files from the document before exporting.
+- --clean-after: Deletes the DXF and PDF files from the document after the ZIP is created.
+- --version-id [id]: Exports from a specific version instead of a workspace.
 
-## Configuration
+### Password Management
 
-Create a `config` file (or run once to generate a template):
+To change your encryption password, delete the .secrets file and run the setup process again.
 
-```json
-{
-    "accessKey": "YOUR_ACCESS_KEY",
-    "secretKey": "YOUR_SECRET_KEY",
-    "documentId": "YOUR_DOCUMENT_ID",
-    "workspaceId": "YOUR_WORKSPACE_ID"
-}
-```
+## Instructions for Building
 
-> **Never commit the `config` file** — it contains your API secrets.
+### Requirements
 
-### Getting Your Credentials
+- Python 3.10 or newer
+- Pip
 
-1. Go to [Onshape My Account > Developer > API Keys](https://cad.onshape.com/user/developer)
-2. Create an API key with appropriate permissions
-3. Copy the access key and secret key to your config
+### Running from Source
 
-### Finding Document and Workspace IDs
+1. Clone the repository.
+2. Install dependencies:
+   pip install -r requirements.txt
+3. Run the script:
+   python onshape_export_tool.py
 
-From any Onshape document URL:
-```
-https://cad.onshape.com/documents/d/{documentId}/w/{workspaceId}/e/{elementId}
-```
+### Creating the Executable
 
-> **Note**: An "element" of an Onshape document is a tab.
+Run the build script to generate a single file executable for your system:
+./build.sh
 
-## Usage
+The executable is saved in the dist folder with the version and architecture in the name.
 
-```bash
-# Basic usage
-python onshape_export_tool.py
+### Running Tests
 
-# With verbose logging
-python onshape_export_tool.py --verbose
-
-# Specify output directory
-python onshape_export_tool.py --out ./my-exports
-```
-
-## How It Works
-
-1. **Cleanup**: Removes any leftover temporary elements from previous runs to ensure a consistent output state.
-2. **Discovery**: Finds all Part Studios and Drawings in the document
-3. **Sheet Metal Export**: Exports flat patterns from Part Studios directly (no orientation needed)
-4. **Plate Export**: For non-sheet-metal parts in Part Studios which contain an "Orient Plates for Export" feature:
-   - Unsuppresses the orient feature
-   - Creates temporary drawings and exports to DXF
-   - Re-suppresses the orient feature
-5. **Drawing Export**: Exports each previously existing drawing as PDF
-6. **Packaging**: Bundles all exports into a timestamped ZIP with operation log and stores them in the ../exports folder
-
-## Building
-
-Build a standalone executable with PyInstaller:
-
-```bash
-source venv/bin/activate
-pip install pyinstaller
-pyinstaller --onefile --name onshape-export onshape_export_tool.py
-```
-
-The executable will be in `dist/onshape-export`. Copy it anywhere and run.
-
-> **Note**: Builds are platform-specific. Build on Windows for Windows, Linux for Linux, etc.
-
-## FeatureScripts
-
-This tool works with companion FeatureScripts that should be added to your Onshape document:
-
-- **Orient Plates for Export**: Orients plate bodies so their largest face aligns with XY plane
-- **Plate Properties**: Computed property for plate thickness (used in export filenames)
-
-## Output
-
-The tool creates a timestamped ZIP file containing:
-- DXF files with thickness prefix (e.g., `3mm_Part_Name.dxf`)
-- PDF files for drawings
-- `export_operation.log` — detailed operation log
-
-## License
-
-MIT
+Run the test suite using pytest:
+python -m pytest tests/
