@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Onshape Manufacturing Export Tool
 
-Exports DXFs from oriented plate parts and PDFs from existing drawings.
-Uses the Onshape REST API to automate the export workflow.
+Automates DXF/PDF exports from Onshape documents via REST API.
 """
 import json
 import sys
@@ -13,7 +12,9 @@ import time
 import zipfile
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple, Union, Callable, TypeVar, cast
+from functools import reduce
+from typing import Dict, Any, List, Optional, Tuple, Callable, TypeVar, cast
+from typing_extensions import TypedDict
 
 
 # ============================================================
@@ -37,6 +38,219 @@ ExportResult = Tuple[str, str]
 TranslationResult = Tuple[str, Optional[str]]
 
 
+def get_run_command() -> str:
+    """Returns appropriate CLI command for frozen exe vs script mode."""
+    if getattr(sys, 'frozen', False):
+        return "./onshape_export_tool"
+    return "python onshape_export_tool.py"
+
+
+# ============================================================
+# SECTION 1b: Document Context
+# ============================================================
+
+class DocContext(TypedDict):
+    """Onshape API paths use /d/{did}/{wvm_type}/{wvm_id}/... format.
+    This bundles those values, enabling workspace/version mode switching.
+    """
+    did: str
+    wvm_type: str  # 'w' = workspace (mutable), 'v' = version, 'm' = microversion
+    wvm_id: str
+
+
+def doc_path(ctx: DocContext, suffix: str = "") -> str:
+    """Build document path segment: /d/{did}/{wvm_type}/{wvm_id}{suffix}"""
+    return f"/d/{ctx['did']}/{ctx['wvm_type']}/{ctx['wvm_id']}{suffix}"
+
+
+def is_mutable(ctx: DocContext) -> bool:
+    """Check if context allows modifications (workspace only)."""
+    return ctx['wvm_type'] == 'w'
+
+
+def make_context(did: str, wid: str) -> DocContext:
+    """Create a workspace context (convenience for migration)."""
+    return DocContext(did=did, wvm_type='w', wvm_id=wid)
+
+
+def make_version_context(did: str, vid: str) -> DocContext:
+    """Create a version context for read-only exports."""
+    return DocContext(did=did, wvm_type='v', wvm_id=vid)
+
+
+# ============================================================
+# SECTION 1c: Secrets Management
+# ============================================================
+
+class Secrets(TypedDict):
+    """API credentials for Onshape authentication."""
+    access_key: str
+    secret_key: str
+
+
+def load_secrets(path: Path) -> Optional[Secrets]:
+    """Accepts both camelCase and snake_case key formats for flexibility."""
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+        access_key = data.get('accessKey') or data.get('access_key')
+        secret_key = data.get('secretKey') or data.get('secret_key')
+        if access_key and secret_key:
+            return Secrets(access_key=access_key, secret_key=secret_key)
+        return None
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def prompt_secrets() -> Secrets:
+    """UnicodeDecodeError retry handles clipboard encoding issues when pasting."""
+    import getpass
+    print("\n--- Onshape API Credentials ---")
+    print("Enter your Onshape API keys (from Developer Portal):\n")
+    
+    while True:
+        try:
+            access_key = input("  Access Key: ").strip()
+            break
+        except UnicodeDecodeError:
+            print("  Error: Invalid characters detected. Please type or paste the key again.")
+    
+    while True:
+        try:
+            secret_key = getpass.getpass("  Secret Key: ").strip()
+            break
+        except UnicodeDecodeError:
+            print("  Error: Invalid characters detected. Please type or paste the key again.")
+    
+    return Secrets(access_key=access_key, secret_key=secret_key)
+
+
+def save_secrets(secrets: Secrets, path: Path) -> None:
+    """Save secrets to a JSON file."""
+    data = {
+        'accessKey': secrets['access_key'],
+        'secretKey': secrets['secret_key']
+    }
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+    logging.info(f"Saved secrets to {path}")
+
+
+def get_or_prompt_secrets(path: Path) -> Secrets:
+    """Load or prompt, offering to persist for future runs."""
+    secrets = load_secrets(path)
+    if secrets:
+        return secrets
+    
+    print(f"No valid secrets found at {path}")
+    secrets = prompt_secrets()
+    
+    # Offer to save
+    save_choice = input("\nSave these credentials for future use? [y/N]: ").strip().lower()
+    if save_choice == 'y':
+        save_secrets(secrets, path)
+        print(f"Saved to {path}")
+    
+    return secrets
+
+
+# ============================================================
+# SECTION 1d: Interactive Utilities
+# ============================================================
+
+def interactive_select(items: List[Dict[str, Any]], prompt: str, 
+                       display_fn: Callable[[Dict[str, Any]], str]) -> Optional[Dict[str, Any]]:
+    """Numbered menu. Returns None on cancel (0) or empty list."""
+    if not items:
+        print("No items available.")
+        return None
+    
+    print(f"\n{prompt}\n")
+    for i, item in enumerate(items, 1):
+        print(f"  {i}. {display_fn(item)}")
+    print("  0. Cancel\n")
+    
+    while True:
+        try:
+            choice = input("Enter number: ").strip()
+            if not choice:
+                continue
+            idx = int(choice)
+            if idx == 0:
+                return None
+            if 1 <= idx <= len(items):
+                return items[idx - 1]
+            print(f"Please enter 1-{len(items)} or 0 to cancel")
+        except ValueError:
+            print("Please enter a number")
+
+
+def prompt_document_config() -> Tuple[str, str]:
+    """Prompt user for document ID and workspace ID."""
+    print("\n--- Document Configuration ---\n")
+    print("You can find these IDs in the Onshape document URL:")
+    print("  https://cad.onshape.com/documents/{documentId}/w/{workspaceId}/...\n")
+    
+    did = input("  Document ID: ").strip()
+    wid = input("  Workspace ID: ").strip()
+    return did, wid
+
+
+def save_document_config(did: str, wid: str, path: Path) -> None:
+    """Save document configuration to file."""
+    data = {
+        'documentId': did,
+        'workspaceId': wid
+    }
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Saved document config to {path}")
+
+
+def load_document_config(path: Path) -> Optional[Tuple[str, str]]:
+    """Load document config from file. Returns (did, wid) or None."""
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+        did = data.get('documentId')
+        wid = data.get('workspaceId')
+        if did and wid and did != "YOUR_DOCUMENT_ID_HERE" and wid != "YOUR_WORKSPACE_ID_HERE":
+            return did, wid
+        return None
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def run_setup_wizard(secrets_path: Path, config_path: Path) -> None:
+    """Run interactive setup wizard for first-time configuration."""
+    print("\n" + "="*60)
+    print("    ONSHAPE EXPORT TOOL - SETUP WIZARD")
+    print("="*60)
+    
+    # Step 1: API Credentials (only if not already configured)
+    print("\nStep 1: API Credentials")
+    print("-" * 40)
+    existing_secrets = load_secrets(secrets_path)
+    if existing_secrets:
+        print(f"✓ Secrets already configured ({secrets_path})")
+    else:
+        secrets = prompt_secrets()
+        save_secrets(secrets, secrets_path)
+    
+    # Step 2: Document Configuration
+    print("\nStep 2: Document Configuration")
+    print("-" * 40)
+    did, wid = prompt_document_config()
+    save_document_config(did, wid, config_path)
+    
+    print("\n" + "="*60)
+    print("    SETUP COMPLETE!")
+    print("="*60)
+    print(f"\nSecrets: {secrets_path}")
+    print(f"Config: {config_path}")
+    print(f"\nYou can now run exports with: {get_run_command()}")
+
+
 # ============================================================
 # SECTION 2: Custom Exceptions
 # ============================================================
@@ -56,48 +270,47 @@ class ElementNotFoundError(Exception):
 
 T = TypeVar('T')
 
-def load_config(path: Union[str, Path] = "config") -> Dict[str, Any]:
-    """Load JSON configuration from file."""
-    try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logging.warning(f"Config file not found at {path}")
-        return {}
-    except json.JSONDecodeError as e:
-        logging.error(f"Error parsing config JSON: {e}")
-        return {}
+
+# ============================================================
+# SECTION 3a: Pipeline Composition Utilities
+# ============================================================
+
+def pipeline(*steps: Callable[[T], T]) -> Callable[[T], T]:
+    """Compose functions left-to-right: pipeline(f, g, h)(x) = h(g(f(x)))
+    
+    Each step receives the output of the previous step.
+    This enables functional workflow composition.
+    """
+    return lambda initial: reduce(lambda state, step: step(state), steps, initial)
 
 
-CONFIG_TEMPLATE = """{
-    "accessKey": "YOUR_ACCESS_KEY_HERE",
-    "secretKey": "YOUR_SECRET_KEY_HERE",
-    "documentId": "YOUR_DOCUMENT_ID_HERE",
-    "workspaceId": "YOUR_WORKSPACE_ID_HERE"
-}
-"""
+class WorkflowState(TypedDict, total=False):
+    """Immutable state passed between workflow steps.
+    
+    Each step returns a new state dict: {**state, 'key': new_value}
+    Using total=False allows optional keys.
+    """
+    # Bound dependencies (injected at start)
+    client: Any  # OnshapeClient
+    ctx: DocContext
+    output_dir: Path
+    # Workflow data (accumulated by steps)
+    results: List[ExportResult]
+    log_entries: List[str]
+    part_studios: List[Dict[str, Any]]
+    drawings: List[Dict[str, Any]]
+    # Final output
+    zip_path: Optional[Path]
+    collision_warnings: List[str]
 
 
-def create_config_template(path: Path) -> None:
-    """Create a template config file with placeholder values."""
-    with open(path, 'w') as f:
-        f.write(CONFIG_TEMPLATE)
-    print(f"""
-╔══════════════════════════════════════════════════════════════════╗
-║                    CONFIGURATION REQUIRED                        ║
-╠══════════════════════════════════════════════════════════════════╣
-║  A template config file has been created at:                     ║
-║  {str(path):<60} ║
-║                                                                  ║
-║  Please edit this file and fill in:                              ║
-║    • accessKey    - Your Onshape API access key                  ║
-║    • secretKey    - Your Onshape API secret key                  ║
-║    • documentId   - The document ID to export from               ║
-║    • workspaceId  - The workspace ID to export from              ║
-║                                                                  ║
-║  Then run this tool again.                                       ║
-╚══════════════════════════════════════════════════════════════════╝
-""")
+def log_step(state: WorkflowState, msg: str) -> WorkflowState:
+    """Helper to add a log entry to state (pure function)."""
+    entry = f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}"
+    logging.info(msg)
+    log_entries = state.get('log_entries', []).copy()
+    log_entries.append(entry)
+    return {**state, 'log_entries': log_entries}
 
 
 def poll_until(
@@ -106,21 +319,7 @@ def poll_until(
     timeout: int = 60,
     interval: float = 2.0
 ) -> T:
-    """Generic polling function.
-    
-    Args:
-        fetch: Function that retrieves fresh data (e.g., API call)
-        predicate: Function that examines data and returns a result when done,
-                   or None to continue polling. May raise exceptions to abort.
-        timeout: Maximum seconds to poll before raising TimeoutError
-        interval: Seconds to wait between fetch calls
-    
-    Returns:
-        The first non-None value returned by predicate
-    
-    Raises:
-        TimeoutError: If timeout exceeded before predicate returns a value
-    """
+    """Poll until predicate returns non-None. Used for translation status checks."""
     start = time.time()
     while time.time() - start < timeout:
         data = fetch()
@@ -136,15 +335,10 @@ def poll_until(
 # ============================================================
 
 class OnshapeClient:
-    """Authenticated HTTP client for Onshape API.
+    """HTTP transport only. Business logic is in standalone functions that accept client.
     
-    This class handles only HTTP transport concerns:
-    - Session management
-    - Authentication
-    - Request/response formatting
-    
-    All business logic is implemented as standalone functions that accept
-    a client instance as their first parameter.
+    Uses HTTP Basic auth with Onshape API keys (not OAuth).
+    Returns parsed JSON or raw bytes depending on Content-Type.
     """
     
     def __init__(self, access_key: str, secret_key: str, base_url: str = API_BASE):
@@ -157,19 +351,7 @@ class OnshapeClient:
         })
 
     def request(self, method: str, endpoint: str, **kwargs) -> Any:
-        """Make an authenticated API request.
-        
-        Args:
-            method: HTTP method (GET, POST, DELETE, etc.)
-            endpoint: API endpoint path (e.g., "/documents/d/{did}/w/{wid}/elements")
-            **kwargs: Additional arguments passed to requests (json, params, etc.)
-        
-        Returns:
-            Parsed JSON response (dict/list) or raw bytes for binary content
-        
-        Raises:
-            requests.RequestException: On HTTP errors or connection failures
-        """
+        """404 on /translations often means missing export rule in Onshape."""
         url = endpoint if endpoint.startswith('http') else f"{self.base_url}{endpoint}"
         try:
             logging.debug(f"API Request: {method} {url}")
@@ -198,26 +380,26 @@ class OnshapeClient:
 # SECTION 5: API Operations (Standalone Functions)
 # ============================================================
 
-def list_elements(client: OnshapeClient, did: str, wid: str) -> List[Dict[str, Any]]:
-    """List all elements (tabs) in a document workspace."""
-    endpoint = f"/documents/d/{did}/w/{wid}/elements"
+def list_elements(client: OnshapeClient, ctx: DocContext) -> List[Dict[str, Any]]:
+    """List all elements (tabs) in a document."""
+    endpoint = f"/documents{doc_path(ctx)}/elements"
     resp = client.request('GET', endpoint)
     return resp if isinstance(resp, list) else resp.get('elements', [])
 
 
-def get_features(client: OnshapeClient, did: str, wid: str, eid: str) -> List[Dict[str, Any]]:
+def get_features(client: OnshapeClient, ctx: DocContext, eid: str) -> List[Dict[str, Any]]:
     """Get all features from a Part Studio."""
-    endpoint = f"/partstudios/d/{did}/w/{wid}/e/{eid}/features"
+    endpoint = f"/partstudios{doc_path(ctx)}/e/{eid}/features"
     resp = client.request('GET', endpoint)
     return resp.get('features', [])
 
 
 def list_parts(
-    client: OnshapeClient, did: str, wid: str, eid: str,
+    client: OnshapeClient, ctx: DocContext, eid: str,
     include_flat_parts: bool = False
 ) -> List[Dict[str, Any]]:
     """List all parts in a Part Studio."""
-    endpoint = f"/parts/d/{did}/w/{wid}/e/{eid}"
+    endpoint = f"/parts{doc_path(ctx)}/e/{eid}"
     params = {}
     if include_flat_parts:
         params['includeFlatParts'] = 'true'
@@ -227,11 +409,7 @@ def list_parts(
 def categorize_parts(parts: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Separate flat patterns from regular parts.
     
-    Flat patterns (sheet metal) should be exported directly without orient transformation.
-    Regular parts that have flat patterns are filtered out (the flat is preferred).
-    
-    Returns:
-        (flat_patterns, regular_parts)
+    Sheet metal flat patterns export directly; their parent parts are filtered out.
     """
     flat_patterns = []
     regular_parts = []
@@ -252,11 +430,11 @@ def categorize_parts(parts: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
 
 
 def get_part_metadata(
-    client: OnshapeClient, did: str, wid: str, eid: str, part_id: str,
+    client: OnshapeClient, ctx: DocContext, eid: str, part_id: str,
     include_computed: bool = True
 ) -> Dict[str, Any]:
     """Get metadata for a specific part, optionally including computed properties."""
-    endpoint = f"/metadata/d/{did}/w/{wid}/e/{eid}/p/{part_id}"
+    endpoint = f"/metadata{doc_path(ctx)}/e/{eid}/p/{part_id}"
     params = {}
     if include_computed:
         params['includeComputedProperties'] = 'true'
@@ -264,29 +442,21 @@ def get_part_metadata(
 
 
 def get_part_bounding_box(
-    client: OnshapeClient, did: str, wid: str, eid: str, part_id: str
+    client: OnshapeClient, ctx: DocContext, eid: str, part_id: str
 ) -> Dict[str, float]:
     """Get bounding box for a specific part. Returns dict with lowX/Y/Z, highX/Y/Z."""
-    endpoint = f"/parts/d/{did}/w/{wid}/e/{eid}/partid/{part_id}/boundingboxes"
+    endpoint = f"/parts{doc_path(ctx)}/e/{eid}/partid/{part_id}/boundingboxes"
     return client.request('GET', endpoint)
 
 
 def get_part_thickness(
-    client: OnshapeClient, did: str, wid: str, eid: str, part_id: str,
+    client: OnshapeClient, ctx: DocContext, eid: str, part_id: str,
     property_name: str = "Thickness"
 ) -> Optional[float]:
-    """Get part thickness in mm.
-    
-    Tries two approaches:
-    1. Read computed property via metadata API
-    2. Fall back to bounding box Z-height (for oriented flat parts)
-    
-    Returns:
-        Thickness in mm, or None if unable to determine
-    """
+    """Returns mm. Tries computed property first, falls back to bounding box Z-height."""
     # Approach 1: Try to read computed property
     try:
-        metadata = get_part_metadata(client, did, wid, eid, part_id, include_computed=True)
+        metadata = get_part_metadata(client, ctx, eid, part_id, include_computed=True)
         properties = metadata.get('properties', [])
         
         for prop in properties:
@@ -311,7 +481,7 @@ def get_part_thickness(
     
     # Approach 2: Fall back to bounding box Z-height
     try:
-        bbox = get_part_bounding_box(client, did, wid, eid, part_id)
+        bbox = get_part_bounding_box(client, ctx, eid, part_id)
         # For oriented flat parts, Z-height is thickness
         # Bounding box values are in meters
         z_height = abs(bbox.get('highZ', 0) - bbox.get('lowZ', 0))
@@ -327,10 +497,7 @@ def get_part_thickness(
 
 
 def format_thickness_prefix(thickness_mm: Optional[float]) -> str:
-    """Format thickness as a filename prefix (e.g., '3.0mm_').
-    
-    Returns empty string if thickness is None or invalid.
-    """
+    """Returns e.g. '3mm' for filenames. Empty string if None/invalid."""
     if thickness_mm is None or thickness_mm <= 0:
         return ""
     
@@ -341,8 +508,7 @@ def format_thickness_prefix(thickness_mm: Optional[float]) -> str:
 
 def update_feature_suppression(
     client: OnshapeClient, 
-    did: str, 
-    wid: str, 
+    ctx: DocContext,
     eid: str, 
     feature: Dict[str, Any], 
     suppressed: bool
@@ -357,20 +523,20 @@ def update_feature_suppression(
         "serializationVersion": "1.2.15",
         "sourceMicroversion": ""
     }
-    endpoint = f"/partstudios/d/{did}/w/{wid}/e/{eid}/features/featureid/{feature_id}"
+    endpoint = f"/partstudios{doc_path(ctx)}/e/{eid}/features/featureid/{feature_id}"
     client.request('POST', endpoint, json=payload)
 
 
-def delete_element(client: OnshapeClient, did: str, wid: str, eid: str) -> None:
+def delete_element(client: OnshapeClient, ctx: DocContext, eid: str) -> None:
     """Delete an element from the document."""
-    endpoint = f"/elements/d/{did}/w/{wid}/e/{eid}"
+    endpoint = f"/elements{doc_path(ctx)}/e/{eid}"
     logging.info(f"Deleting element {eid}")
     client.request('DELETE', endpoint)
 
 
-def create_drawing(client: OnshapeClient, did: str, wid: str, name: str) -> str:
+def create_drawing(client: OnshapeClient, ctx: DocContext, name: str) -> str:
     """Create an empty drawing. Returns the new element ID."""
-    endpoint = f"/drawings/d/{did}/w/{wid}/create"
+    endpoint = f"/drawings{doc_path(ctx)}/create"
     payload = {
         "drawingName": name,
         "standard": "ISO",
@@ -388,14 +554,13 @@ def create_drawing(client: OnshapeClient, did: str, wid: str, name: str) -> str:
 
 def add_view_to_drawing(
     client: OnshapeClient, 
-    did: str, 
-    wid: str, 
+    ctx: DocContext,
     drawing_eid: str,
     source_eid: str, 
     part_id: str
 ) -> None:
     """Add a 1:1 top view of a part to a drawing."""
-    endpoint = f"/drawings/d/{did}/w/{wid}/e/{drawing_eid}/modify"
+    endpoint = f"/drawings{doc_path(ctx)}/e/{drawing_eid}/modify"
     payload = {
         "description": "Add Top View 1:1",
         "jsonRequests": [
@@ -426,14 +591,13 @@ def add_view_to_drawing(
 
 def initiate_translation(
     client: OnshapeClient, 
-    did: str, 
-    wid: str, 
+    ctx: DocContext,
     eid: str, 
     format_name: str, 
     destination_name: str
 ) -> str:
     """Start a translation (export) job. Returns the translation ID."""
-    endpoint = f"/drawings/d/{did}/w/{wid}/e/{eid}/translations"
+    endpoint = f"/drawings{doc_path(ctx)}/e/{eid}/translations"
     payload = {
         "formatName": format_name,
         "storeInDocument": True,
@@ -476,8 +640,7 @@ def poll_translation(client: OnshapeClient, translation_id: str, timeout: int = 
 
 def wait_for_microversion_change(
     client: OnshapeClient, 
-    did: str, 
-    wid: str, 
+    ctx: DocContext,
     eid: str, 
     old_mv: Optional[str], 
     timeout: int = 60
@@ -486,7 +649,7 @@ def wait_for_microversion_change(
     logging.info(f"Waiting for element {eid} to update...")
     
     def fetch():
-        elements = list_elements(client, did, wid)
+        elements = list_elements(client, ctx)
         return next((e for e in elements if e['id'] == eid), None)
     
     def check_microversion(element):
@@ -504,18 +667,117 @@ def wait_for_microversion_change(
     return result
 
 
-def download_blob(client: OnshapeClient, did: str, wid: str, eid: str) -> bytes:
+def download_blob(client: OnshapeClient, ctx: DocContext, eid: str) -> bytes:
     """Download blob element content as bytes."""
-    endpoint = f"/blobelements/d/{did}/w/{wid}/e/{eid}"
+    endpoint = f"/blobelements{doc_path(ctx)}/e/{eid}"
     logging.debug(f"Downloading blob {eid}")
     return cast(bytes, client.request('GET', endpoint))
 
 
-def get_element_microversion(client: OnshapeClient, did: str, wid: str, eid: str) -> Optional[str]:
+def get_element_microversion(client: OnshapeClient, ctx: DocContext, eid: str) -> Optional[str]:
     """Get the current microversion ID of an element."""
-    elements = list_elements(client, did, wid)
+    elements = list_elements(client, ctx)
     element = next((e for e in elements if e['id'] == eid), None)
     return element.get('microversionId') if element else None
+
+
+# ============================================================
+# SECTION 5a: Interactive API Functions
+# ============================================================
+
+def list_documents(client: OnshapeClient, limit: int = 20) -> List[Dict[str, Any]]:
+    """List recently modified documents.
+    
+    Returns list of documents with id, name, modifiedAt, etc.
+    """
+    response = client.request('GET', '/documents', params={
+        'sortColumn': 'modifiedAt',
+        'sortOrder': 'desc',
+        'limit': limit
+    })
+    return response.get('items', []) if isinstance(response, dict) else response
+
+
+def list_workspaces(client: OnshapeClient, did: str) -> List[Dict[str, Any]]:
+    """List workspaces in a document."""
+    return client.request('GET', f'/documents/d/{did}/workspaces')
+
+
+def list_versions(client: OnshapeClient, did: str) -> List[Dict[str, Any]]:
+    """List versions in a document."""
+    return client.request('GET', f'/documents/d/{did}/versions')
+
+
+def run_interactive_workflow(client: OnshapeClient, output_dir: Path,
+                             clean_before: bool = False, clean_after: bool = False) -> Optional[Path]:
+    """Run export workflow with interactive document/element selection.
+    
+    Flow:
+    1. List and select document
+    2. Choose workspace or version
+    3. Run export on selected context
+    """
+    print("\n" + "="*60)
+    print("    INTERACTIVE EXPORT")
+    print("="*60)
+    
+    # Step 1: Select document
+    print("\nFetching recent documents...")
+    documents = list_documents(client)
+    if not documents:
+        print("No documents found.")
+        return None
+    
+    doc = interactive_select(
+        documents,
+        "Select a document:",
+        lambda d: f"{d['name']} (modified: {d.get('modifiedAt', 'unknown')[:10]})"
+    )
+    if not doc:
+        print("Cancelled.")
+        return None
+    
+    did = doc['id']
+    print(f"\nSelected: {doc['name']}")
+    
+    # Step 2: Choose workspace or version
+    print("\nFetching workspaces and versions...")
+    workspaces = list_workspaces(client, did)
+    versions = list_versions(client, did)
+    
+    # Build combined list
+    options = []
+    for ws in workspaces:
+        options.append({'type': 'workspace', 'id': ws['id'], 'name': ws.get('name', 'Main'), 'data': ws})
+    for v in versions:
+        options.append({'type': 'version', 'id': v['id'], 'name': v.get('name', 'Unnamed'), 'data': v})
+    
+    if not options:
+        print("No workspaces or versions found.")
+        return None
+    
+    choice = interactive_select(
+        options,
+        "Select workspace or version:",
+        lambda o: f"[{o['type'].upper()}] {o['name']}"
+    )
+    if not choice:
+        print("Cancelled.")
+        return None
+    
+    # Step 3: Create context and run
+    if choice['type'] == 'workspace':
+        ctx = make_context(did, choice['id'])
+        print(f"\nExporting from workspace: {choice['name']}")
+    else:
+        ctx = make_version_context(did, choice['id'])
+        print(f"\nExporting from version: {choice['name']}")
+        if clean_before or clean_after:
+            print("Note: --clean flags ignored for version exports")
+            clean_before = clean_after = False
+    
+    return run_export_workflow(client, ctx, output_dir, 
+                               clean_before=clean_before, clean_after=clean_after)
 
 
 # ============================================================
@@ -525,19 +787,19 @@ def get_element_microversion(client: OnshapeClient, did: str, wid: str, eid: str
 # Each function has a single responsibility and can be composed
 # to create different export workflows.
 
-def cleanup_temp_elements(client: OnshapeClient, did: str, wid: str) -> int:
+def cleanup_temp_elements(client: OnshapeClient, ctx: DocContext) -> int:
     """Delete any leftover temporary elements from previous runs.
     
     Returns:
         Number of elements deleted
     """
-    elements = list_elements(client, did, wid)
+    elements = list_elements(client, ctx)
     temp_elements = [e for e in elements if e.get('name', '').startswith(TEMP_ELEMENT_PREFIXES)]
     
     deleted = 0
     for e in temp_elements:
         try:
-            delete_element(client, did, wid, e['id'])
+            delete_element(client, ctx, e['id'])
             deleted += 1
         except Exception as ex:
             logging.debug(f"Failed to delete leftover {e['id']}: {ex}")
@@ -547,17 +809,79 @@ def cleanup_temp_elements(client: OnshapeClient, did: str, wid: str) -> int:
     return deleted
 
 
+def find_blobs_by_extension(
+    client: OnshapeClient, 
+    ctx: DocContext, 
+    extensions: Tuple[str, ...]
+) -> List[Dict[str, Any]]:
+    """Find blob elements matching given extensions (e.g., '.dxf', '.pdf').
+    
+    Args:
+        extensions: Tuple of lowercase extensions including the dot
+        
+    Returns:
+        List of matching blob element dicts
+    """
+    elements = list_elements(client, ctx)
+    blobs = []
+    for e in elements:
+        if e.get('elementType') == 'BLOB':
+            name = e.get('name', '').lower()
+            if any(name.endswith(ext) for ext in extensions):
+                blobs.append(e)
+    return blobs
+
+
+def delete_elements(
+    client: OnshapeClient, 
+    ctx: DocContext, 
+    elements: List[Dict[str, Any]]
+) -> int:
+    """Delete multiple elements. Returns count successfully deleted."""
+    deleted = 0
+    for e in elements:
+        try:
+            delete_element(client, ctx, e['id'])
+            deleted += 1
+        except Exception as ex:
+            logging.debug(f"Failed to delete {e['id']}: {ex}")
+    return deleted
+
+
+def cleanup_exports(client: OnshapeClient, ctx: DocContext) -> int:
+    """Delete all DXF and PDF blobs from document.
+    
+    Composable cleanup operation for --clean flag.
+    Only works on mutable contexts (workspaces).
+    
+    Returns:
+        Number of elements deleted
+    """
+    if not is_mutable(ctx):
+        logging.warning("Cannot cleanup exports in immutable context (version/microversion)")
+        return 0
+    
+    blobs = find_blobs_by_extension(client, ctx, ('.dxf', '.pdf'))
+    if not blobs:
+        logging.info("No DXF/PDF blobs to clean up")
+        return 0
+    
+    logging.info(f"Cleaning up {len(blobs)} DXF/PDF files...")
+    deleted = delete_elements(client, ctx, blobs)
+    logging.info(f"Deleted {deleted} export files")
+    return deleted
+
+
 def discover_exportables(
     client: OnshapeClient, 
-    did: str, 
-    wid: str
+    ctx: DocContext
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Categorize document elements into Part Studios and Drawings.
     
     Returns:
         Tuple of (part_studios, drawings) where each is a list of element dicts
     """
-    elements = list_elements(client, did, wid)
+    elements = list_elements(client, ctx)
     
     part_studios = [e for e in elements if e['elementType'] == 'PARTSTUDIO']
     drawings = [
@@ -597,8 +921,7 @@ def find_orient_feature(features: List[Dict[str, Any]]) -> Optional[Dict[str, An
 
 def export_part_as_dxf(
     client: OnshapeClient,
-    did: str,
-    wid: str,
+    ctx: DocContext,
     part_studio_eid: str,
     part: Dict[str, Any]
 ) -> Optional[ExportResult]:
@@ -615,23 +938,23 @@ def export_part_as_dxf(
     
     # Create temp drawing
     temp_name = f"TEMP_{part_name}_{int(time.time())}"
-    temp_drawing_id = create_drawing(client, did, wid, temp_name)
-    old_mv = get_element_microversion(client, did, wid, temp_drawing_id)
+    temp_drawing_id = create_drawing(client, ctx, temp_name)
+    old_mv = get_element_microversion(client, ctx, temp_drawing_id)
     logging.info(f"Created temp drawing for '{part_name}'")
     
     try:
         # Add view and wait for it to render
-        add_view_to_drawing(client, did, wid, temp_drawing_id, part_studio_eid, part_id)
-        wait_for_microversion_change(client, did, wid, temp_drawing_id, old_mv)
+        add_view_to_drawing(client, ctx, temp_drawing_id, part_studio_eid, part_id)
+        wait_for_microversion_change(client, ctx, temp_drawing_id, old_mv)
         
         # Get part thickness (computed property or bounding box fallback)
-        thickness = get_part_thickness(client, did, wid, part_studio_eid, part_id)
+        thickness = get_part_thickness(client, ctx, part_studio_eid, part_id)
         thickness_prefix = format_thickness_prefix(thickness)
         if thickness:
             logging.debug(f"Part '{part_name}' thickness: {thickness:.2f}mm")
         
         # Export to DXF
-        trans_id = initiate_translation(client, did, wid, temp_drawing_id, 'DXF', part_name)
+        trans_id = initiate_translation(client, ctx, temp_drawing_id, 'DXF', part_name)
         result_id, export_rule_filename = poll_translation(client, trans_id)
         
         # Use export rule filename if available, otherwise fall back to part name
@@ -648,15 +971,14 @@ def export_part_as_dxf(
     finally:
         # Always clean up temp drawing
         try:
-            delete_element(client, did, wid, temp_drawing_id)
+            delete_element(client, ctx, temp_drawing_id)
         except Exception as e:
             logging.warning(f"Failed to delete temp drawing: {e}")
 
 
 def export_part_studio(
     client: OnshapeClient,
-    did: str,
-    wid: str,
+    ctx: DocContext,
     part_studio: Dict[str, Any]
 ) -> List[ExportResult]:
     """Export all parts from a Part Studio as DXFs.
@@ -675,7 +997,7 @@ def export_part_studio(
     logging.info(f"Processing Part Studio: {name}")
     
     # Phase 1: Get all parts including flat patterns and categorize them
-    all_parts = list_parts(client, did, wid, eid, include_flat_parts=True)
+    all_parts = list_parts(client, ctx, eid, include_flat_parts=True)
     flat_patterns, regular_parts = categorize_parts(all_parts)
     
     logging.info(f"Found {len(flat_patterns)} flat patterns, {len(regular_parts)} regular parts")
@@ -684,7 +1006,7 @@ def export_part_studio(
     for flat in flat_patterns:
         flat_name = flat.get('name', 'unnamed_flat')
         try:
-            result = export_part_as_dxf(client, did, wid, eid, flat)
+            result = export_part_as_dxf(client, ctx, eid, flat)
             if result:
                 results.append(result)
                 logging.info(f"Exported flat pattern '{flat_name}'")
@@ -696,7 +1018,7 @@ def export_part_studio(
         logging.info(f"No regular parts to export in {name}")
         return results
     
-    features = get_features(client, did, wid, eid)
+    features = get_features(client, ctx, eid)
     orient_feature = find_orient_feature(features)
     
     if not orient_feature:
@@ -705,17 +1027,17 @@ def export_part_studio(
     
     # Unsuppress feature
     logging.info(f"Unsuppressing '{orient_feature.get('name')}'")
-    update_feature_suppression(client, did, wid, eid, orient_feature, False)
+    update_feature_suppression(client, ctx, eid, orient_feature, False)
     
     try:
         time.sleep(5)  # Allow Part Studio to regenerate
         # Re-fetch parts after orient feature is unsuppressed
-        oriented_parts = list_parts(client, did, wid, eid)
+        oriented_parts = list_parts(client, ctx, eid)
         
         for part in oriented_parts:
             part_name = part.get('name', 'unnamed_part')
             try:
-                result = export_part_as_dxf(client, did, wid, eid, part)
+                result = export_part_as_dxf(client, ctx, eid, part)
                 if result:
                     results.append(result)
             except Exception as e:
@@ -723,7 +1045,7 @@ def export_part_studio(
                 
     finally:
         # Always re-suppress feature
-        update_feature_suppression(client, did, wid, eid, orient_feature, True)
+        update_feature_suppression(client, ctx, eid, orient_feature, True)
         logging.info(f"Re-suppressed '{orient_feature.get('name')}'")
     
     return results
@@ -731,8 +1053,7 @@ def export_part_studio(
 
 def export_drawing_as_pdf(
     client: OnshapeClient,
-    did: str,
-    wid: str,
+    ctx: DocContext,
     drawing: Dict[str, Any]
 ) -> Optional[ExportResult]:
     """Export an existing drawing as PDF.
@@ -746,7 +1067,7 @@ def export_drawing_as_pdf(
     logging.info(f"Processing drawing: {name}")
     
     try:
-        trans_id = initiate_translation(client, did, wid, eid, 'PDF', name)
+        trans_id = initiate_translation(client, ctx, eid, 'PDF', name)
         result_id, export_rule_filename = poll_translation(client, trans_id)
         
         # Use export rule filename if available, otherwise fall back to drawing name
@@ -763,8 +1084,7 @@ def export_drawing_as_pdf(
 
 def package_results(
     client: OnshapeClient,
-    did: str,
-    wid: str,
+    ctx: DocContext,
     results: List[ExportResult],
     output_dir: Path,
     log_entries: List[str]
@@ -803,7 +1123,7 @@ def package_results(
             seen_filenames[safe_name] = result_id
             
             try:
-                content = download_blob(client, did, wid, result_id)
+                content = download_blob(client, ctx, result_id)
                 zf.writestr(safe_name, content)
             except Exception as e:
                 logging.error(f"Failed to download {result_id}: {e}")
@@ -817,79 +1137,142 @@ def package_results(
 
 def run_export_workflow(
     client: OnshapeClient,
-    did: str,
-    wid: str,
-    output_dir: Path
+    ctx: DocContext,
+    output_dir: Path,
+    clean_before: bool = False,
+    clean_after: bool = False
 ) -> Optional[Path]:
-    """Main export workflow orchestrator.
+    """Main export workflow orchestrator using pipeline composition.
     
     Steps:
-    1. Cleanup leftover temp elements
+    1. Cleanup leftover temp elements (and pre-clean if requested)
     2. Discover Part Studios and Drawings
     3. Export parts from Part Studios as DXFs
     4. Export Drawings as PDFs
     5. Package all results into a ZIP
+    6. Post-clean if requested
+    
+    Args:
+        clean_before: If True, delete existing DXF/PDF blobs before export
+        clean_after: If True, delete new DXF/PDF blobs after packaging
     
     Returns:
         Path to the created ZIP file, or None on failure
     """
-    log_entries: List[str] = []
-    
-    def log(msg: str):
-        logging.info(msg)
-        log_entries.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}")
-    
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    try:
-        # Step 1: Cleanup
-        cleanup_temp_elements(client, did, wid)
-        
-        # Step 2: Discovery
-        part_studios, drawings = discover_exportables(client, did, wid)
-        log(f"Found {len(part_studios)} Part Studios, {len(drawings)} drawings")
-        
-        # Step 3: Export Part Studios → DXF
-        results: List[ExportResult] = []
-        for ps in part_studios:
-            ps_results = export_part_studio(client, did, wid, ps)
+    # Step functions (pure: WorkflowState -> WorkflowState)
+    def step_init(state: WorkflowState) -> WorkflowState:
+        """Initialize workflow state."""
+        return log_step(state, "Starting export workflow")
+    
+    def step_pre_clean(state: WorkflowState) -> WorkflowState:
+        """Pre-clean: delete existing exports if requested."""
+        if clean_before and is_mutable(state['ctx']):
+            deleted = cleanup_exports(state['client'], state['ctx'])
+            if deleted > 0:
+                return log_step(state, f"Pre-cleaned {deleted} existing exports")
+        return state
+    
+    def step_cleanup_temp(state: WorkflowState) -> WorkflowState:
+        """Cleanup leftover temp elements."""
+        cleanup_temp_elements(state['client'], state['ctx'])
+        return state
+    
+    def step_discover(state: WorkflowState) -> WorkflowState:
+        """Discover Part Studios and Drawings."""
+        part_studios, drawings = discover_exportables(state['client'], state['ctx'])
+        state = {**state, 'part_studios': part_studios, 'drawings': drawings}
+        return log_step(state, f"Found {len(part_studios)} Part Studios, {len(drawings)} drawings")
+    
+    def step_export_dxfs(state: WorkflowState) -> WorkflowState:
+        """Export parts from Part Studios as DXFs."""
+        results = list(state.get('results', []))
+        for ps in state.get('part_studios', []):
+            ps_results = export_part_studio(state['client'], state['ctx'], ps)
             results.extend(ps_results)
             for _, filename in ps_results:
-                log(f"Exported: {filename}")
-        
-        # Step 4: Export Drawings → PDF
-        for dr in drawings:
-            result = export_drawing_as_pdf(client, did, wid, dr)
+                state = log_step(state, f"Exported: {filename}")
+        return {**state, 'results': results}
+    
+    def step_export_pdfs(state: WorkflowState) -> WorkflowState:
+        """Export Drawings as PDFs."""
+        results = list(state.get('results', []))
+        for dr in state.get('drawings', []):
+            result = export_drawing_as_pdf(state['client'], state['ctx'], dr)
             if result:
                 results.append(result)
-                log(f"Exported: {result[1]}")
+                state = log_step(state, f"Exported: {result[1]}")
+        return {**state, 'results': results}
+    
+    def step_package(state: WorkflowState) -> WorkflowState:
+        """Package results into ZIP."""
+        results = state.get('results', [])
+        log_entries = state.get('log_entries', [])
+        zip_path, collision_warnings = package_results(
+            state['client'], state['ctx'], results, state['output_dir'], log_entries
+        )
+        state = {**state, 'zip_path': zip_path, 'collision_warnings': collision_warnings}
+        if zip_path:
+            return log_step(state, f"SUCCESS: {zip_path}")
+        else:
+            return log_step(state, "No files were exported")
+    
+    def step_post_clean(state: WorkflowState) -> WorkflowState:
+        """Post-clean: delete exports from document if requested."""
+        if clean_after and is_mutable(state['ctx']):
+            deleted = cleanup_exports(state['client'], state['ctx'])
+            if deleted > 0:
+                return log_step(state, f"Post-cleaned {deleted} exports from document")
+        return state
+    
+    # Build initial state with injected dependencies
+    initial_state: WorkflowState = {
+        'client': client,
+        'ctx': ctx,
+        'output_dir': output_dir,
+        'results': [],
+        'log_entries': [],
+        'part_studios': [],
+        'drawings': [],
+        'zip_path': None,
+        'collision_warnings': []
+    }
+    
+    try:
+        # Compose and execute pipeline
+        workflow = pipeline(
+            step_init,
+            step_pre_clean,
+            step_cleanup_temp,
+            step_discover,
+            step_export_dxfs,
+            step_export_pdfs,
+            step_package,
+            step_post_clean
+        )
         
-        # Step 5: Package
-        zip_path, collision_warnings = package_results(client, did, wid, results, output_dir, log_entries)
+        final_state = workflow(initial_state)
+        zip_path = final_state.get('zip_path')
         
         if zip_path:
-            log(f"SUCCESS: {zip_path}")
             print(f"\n--- SUCCESS ---\nZIP file ready: {zip_path}\n")
             
-            # Display collision warnings if any
+            collision_warnings = final_state.get('collision_warnings', [])
             if collision_warnings:
                 print("--- FILENAME COLLISIONS ---")
                 print("The following files had duplicate names. First occurrence was kept, others skipped:")
                 for warning in collision_warnings:
                     print(f"  • {warning}")
                 print("\nPlease review your export rules to ensure unique filenames.\n")
-            
-            return zip_path
-        else:
-            log("No files were exported")
-            return None
-            
+        
+        return zip_path
+        
     except Exception as e:
         logging.error(f"Workflow failed: {e}")
         error_log = output_dir / "critical_error.log"
         with open(error_log, "w") as f:
-            f.write("\n".join(log_entries))
-            f.write(f"\nCRITICAL ERROR: {e}")
+            f.write(f"CRITICAL ERROR: {e}")
         return None
 
 
@@ -902,54 +1285,68 @@ def main():
     parser = argparse.ArgumentParser(description="Onshape Manufacturing Export Tool")
     parser.add_argument("--out", default="exports", help="Output directory")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--clean-before", action="store_true", 
+                        help="Delete existing DXFs/PDFs before export (workspace only)")
+    parser.add_argument("--clean-after", action="store_true", 
+                        help="Delete DXFs/PDFs from document after packaging (workspace only)")
+    parser.add_argument("--version-id", 
+                        help="Export from version instead of workspace (read-only)")
+    parser.add_argument("--setup", action="store_true",
+                        help="Run interactive setup wizard")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Interactively browse and select document to export")
     args = parser.parse_args()
 
     # Determine base directory (works for both script and packaged exe)
     if getattr(sys, 'frozen', False):
-        # Running as packaged executable
         base_dir = Path(sys.executable).parent
     else:
-        # Running as script
         base_dir = Path(__file__).parent
     
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format=LOG_FORMAT)
 
+    secrets_path = base_dir / ".secrets"
     config_path = base_dir / "config"
-    
-    # Check if config exists, create template if not
-    if not config_path.exists():
-        create_config_template(config_path)
-        return
-    
-    config = load_config(config_path)
-    
-    # Validate required config
-    access_key = config.get('accessKey')
-    secret_key = config.get('secretKey')
-    did = config.get('documentId')
-    wid = config.get('workspaceId')
-
-    # Check for placeholder values
-    if access_key == "YOUR_ACCESS_KEY_HERE" or not access_key:
-        print("ERROR: Please fill in your Onshape API access key in the config file.")
-        return
-    
-    if secret_key == "YOUR_SECRET_KEY_HERE" or not secret_key:
-        print("ERROR: Please fill in your Onshape API secret key in the config file.")
-        return
-    
-    if did == "YOUR_DOCUMENT_ID_HERE" or not did:
-        print("ERROR: Please fill in the document ID in the config file.")
-        return
-    
-    if wid == "YOUR_WORKSPACE_ID_HERE" or not wid:
-        print("ERROR: Please fill in the workspace ID in the config file.")
-        return
-
-    client = OnshapeClient(access_key, secret_key)
     output_path = base_dir / args.out
-    run_export_workflow(client, did, wid, output_path)
+    
+    # Handle --setup mode
+    if args.setup:
+        run_setup_wizard(secrets_path, config_path)
+        return
+    
+    # Load or prompt for secrets
+    secrets = get_or_prompt_secrets(secrets_path)
+    client = OnshapeClient(secrets['access_key'], secrets['secret_key'])
+    
+    # Handle --interactive mode
+    if args.interactive:
+        run_interactive_workflow(client, output_path,
+                                clean_before=args.clean_before,
+                                clean_after=args.clean_after)
+        return
+    
+    # Standard mode: load document config
+    doc_config = load_document_config(config_path)
+    if not doc_config:
+        print("No document configuration found.")
+        print(f"Run with {get_run_command()} --setup to configure, or --interactive to browse documents.")
+        return
+    
+    did, wid = doc_config
+    
+    # Create context: use version if specified, otherwise workspace
+    if args.version_id:
+        ctx = make_version_context(did, args.version_id)
+        logging.info(f"Exporting from version: {args.version_id}")
+        if args.clean_before or args.clean_after:
+            logging.warning("--clean-before/--clean-after ignored: cannot modify immutable version")
+    else:
+        ctx = make_context(did, wid)
+    
+    run_export_workflow(client, ctx, output_path, 
+                        clean_before=args.clean_before, 
+                        clean_after=args.clean_after)
 
 
 if __name__ == "__main__":
