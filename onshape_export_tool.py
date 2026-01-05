@@ -304,7 +304,7 @@ def format_thickness_prefix(thickness_mm: Optional[float]) -> str:
     
     # Format to 1 decimal place, removing trailing zeros
     formatted = f"{thickness_mm:.1f}".rstrip('0').rstrip('.')
-    return f"{formatted}mm_"
+    return f"{formatted}mm"
 
 
 def update_feature_suppression(
