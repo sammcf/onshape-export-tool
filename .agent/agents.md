@@ -350,4 +350,4 @@ When adding or modifying API requests:
 
 - The Onshape REST API is incredibly powerful. Having a local spec and testing setup with Bruno suggests a lot of future possibilities.
 - I erroneously assumed that computed properties would not be available over the wire but *they are* - you just have to query the appropriate metadata endpoint with the right parameters.
-- Lots of refactoring and tidying up opportunities. In fact, a rewrite in go-lang probably wouldn't go astray - this has given me a strong understanding of the data flow and processes.
+- Lots of refactoring and tidying up opportunities. In fact, a rewrite in go-lang probably wouldn't go astray - this has given me a strong understanding of the data flow and processes. Maybe using the [Charm framework?](https://charm.land/)
