@@ -32,6 +32,9 @@ TEMP_ELEMENT_PREFIXES = ("TEMP_", "DEBUG_VIEW_", "TEST_MV_")
 # Type alias for export results: (element_id, filename)
 ExportResult = Tuple[str, str]
 
+# Type alias for translation results: (element_id, export_rule_filename or None)
+TranslationResult = Tuple[str, Optional[str]]
+
 
 # ============================================================
 # SECTION 2: Custom Exceptions
@@ -283,8 +286,8 @@ def initiate_translation(
     return cast(str, resp.get('id'))
 
 
-def poll_translation(client: OnshapeClient, translation_id: str, timeout: int = 300) -> str:
-    """Poll until translation completes. Returns the result element ID."""
+def poll_translation(client: OnshapeClient, translation_id: str, timeout: int = 300) -> TranslationResult:
+    """Poll until translation completes. Returns (result_element_id, export_rule_filename)."""
     endpoint = f"/translations/{translation_id}"
     
     def fetch():
@@ -295,7 +298,8 @@ def poll_translation(client: OnshapeClient, translation_id: str, timeout: int = 
         if state == 'DONE':
             ids = resp.get('resultElementIds', [])
             if ids:
-                return ids[0]
+                export_rule_filename = resp.get('exportRuleFileName')  # May be None
+                return (ids[0], export_rule_filename)
             raise TranslationError("Translation done but no result element IDs found")
         elif state == 'FAILED':
             raise TranslationError(f"Translation failed: {resp.get('failureReason', 'Unknown reason')}")
@@ -431,13 +435,13 @@ def export_part_as_dxf(
     wid: str,
     part_studio_eid: str,
     part: Dict[str, Any]
-) -> Optional[str]:
+) -> Optional[ExportResult]:
     """Export a single part as DXF via temporary drawing.
     
     Creates a temp drawing, adds a top view, exports to DXF, then cleans up.
     
     Returns:
-        Result element ID on success, None on failure
+        (result_element_id, filename) tuple on success, None on failure
     """
     part_id = cast(str, part.get('partId'))
     part_name = cast(str, part.get('name', 'unnamed_part'))
@@ -455,9 +459,15 @@ def export_part_as_dxf(
         
         # Export to DXF
         trans_id = initiate_translation(client, did, wid, temp_drawing_id, 'DXF', part_name)
-        result_id = poll_translation(client, trans_id)
-        logging.info(f"Exported '{part_name}' → {result_id}")
-        return result_id
+        result_id, export_rule_filename = poll_translation(client, trans_id)
+        
+        # Use export rule filename if available, otherwise fall back to part name
+        filename = export_rule_filename or f"{part_name}.dxf"
+        if not filename.lower().endswith('.dxf'):
+            filename += '.dxf'
+        
+        logging.info(f"Exported '{part_name}' → {result_id} ({filename})")
+        return (result_id, filename)
         
     finally:
         # Always clean up temp drawing
@@ -507,9 +517,9 @@ def export_part_studio(
         for part in parts:
             part_name = part.get('name', 'unnamed_part')
             try:
-                result_id = export_part_as_dxf(client, did, wid, eid, part)
-                if result_id:
-                    results.append((result_id, f"{part_name}.dxf"))
+                result = export_part_as_dxf(client, did, wid, eid, part)
+                if result:
+                    results.append(result)
             except Exception as e:
                 logging.error(f"Failed to export part '{part_name}': {e}")
                 
@@ -539,9 +549,15 @@ def export_drawing_as_pdf(
     
     try:
         trans_id = initiate_translation(client, did, wid, eid, 'PDF', name)
-        result_id = poll_translation(client, trans_id)
-        logging.info(f"Exported '{name}' → {result_id}")
-        return (result_id, f"{name}.pdf")
+        result_id, export_rule_filename = poll_translation(client, trans_id)
+        
+        # Use export rule filename if available, otherwise fall back to drawing name
+        filename = export_rule_filename or f"{name}.pdf"
+        if not filename.lower().endswith('.pdf'):
+            filename += '.pdf'
+        
+        logging.info(f"Exported '{name}' → {result_id} ({filename})")
+        return (result_id, filename)
     except Exception as e:
         logging.error(f"Failed to export drawing '{name}': {e}")
         return None
@@ -566,25 +582,14 @@ def package_results(
     
     logging.info(f"Downloading {len(results)} files...")
     
-    # Get current element names for proper filenames
-    elements = list_elements(client, did, wid)
-    element_names = {el['id']: el['name'] for el in elements}
-    
     zip_name = f"onshape_export_{int(time.time())}.zip"
     zip_path = output_dir / zip_name
     
     with zipfile.ZipFile(zip_path, 'w') as zf:
-        for result_id, fallback_name in results:
+        for result_id, filename in results:
             try:
-                # Use actual element name if available
-                actual_name = element_names.get(result_id, fallback_name)
-                if fallback_name.endswith('.dxf') and not actual_name.lower().endswith('.dxf'):
-                    actual_name += '.dxf'
-                elif fallback_name.endswith('.pdf') and not actual_name.lower().endswith('.pdf'):
-                    actual_name += '.pdf'
-                
                 content = download_blob(client, did, wid, result_id)
-                safe_name = actual_name.replace(' ', '_').replace('/', '_')
+                safe_name = filename.replace(' ', '_').replace('/', '_')
                 zf.writestr(safe_name, content)
             except Exception as e:
                 logging.error(f"Failed to download {result_id}: {e}")
