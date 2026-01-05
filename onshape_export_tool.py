@@ -144,6 +144,13 @@ class OnshapeClient:
             response = self.session.request(method, url, **kwargs)
             if response.status_code >= 400:
                 logging.error(f"Error {response.status_code}: {response.text}")
+                # Provide helpful hint for 404 errors on translation endpoints
+                if response.status_code == 404 and '/translations' in endpoint:
+                    logging.error(
+                        "HINT: A 404 on translation endpoints often indicates a missing export rule. "
+                        "Check that you have a valid export rule configured in Onshape for this "
+                        "element type (Part Studio DXF, Drawing PDF, etc.)."
+                    )
             response.raise_for_status()
             
             content_type = response.headers.get('Content-Type', '')
@@ -173,10 +180,43 @@ def get_features(client: OnshapeClient, did: str, wid: str, eid: str) -> List[Di
     return resp.get('features', [])
 
 
-def list_parts(client: OnshapeClient, did: str, wid: str, eid: str) -> List[Dict[str, Any]]:
+def list_parts(
+    client: OnshapeClient, did: str, wid: str, eid: str,
+    include_flat_parts: bool = False
+) -> List[Dict[str, Any]]:
     """List all parts in a Part Studio."""
     endpoint = f"/parts/d/{did}/w/{wid}/e/{eid}"
-    return client.request('GET', endpoint)
+    params = {}
+    if include_flat_parts:
+        params['includeFlatParts'] = 'true'
+    return client.request('GET', endpoint, params=params)
+
+
+def categorize_parts(parts: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Separate flat patterns from regular parts.
+    
+    Flat patterns (sheet metal) should be exported directly without orient transformation.
+    Regular parts that have flat patterns are filtered out (the flat is preferred).
+    
+    Returns:
+        (flat_patterns, regular_parts)
+    """
+    flat_patterns = []
+    regular_parts = []
+    flat_part_originals = set()  # IDs of parts that have flat patterns
+    
+    for part in parts:
+        if part.get('isFlattenedBody'):
+            flat_patterns.append(part)
+            if part.get('unflattenedPartId'):
+                flat_part_originals.add(part['unflattenedPartId'])
+        else:
+            regular_parts.append(part)
+    
+    # Filter out regular parts that are original sheet metal (they have flat patterns)
+    regular_parts = [p for p in regular_parts if p.get('partId') not in flat_part_originals]
+    
+    return flat_patterns, regular_parts
 
 
 def update_feature_suppression(
@@ -281,6 +321,12 @@ def initiate_translation(
         "destinationName": destination_name,
         "includeFormedCentermarks": False
     }
+    
+    # Add DXF-specific options for flat pattern exports
+    if format_name == 'DXF':
+        payload["includeBendCenterlines"] = True
+        payload["includeBendLines"] = False
+    
     logging.info(f"Initiating {format_name} translation for element {eid}")
     resp = client.request('POST', endpoint, json=payload)
     return cast(str, resp.get('id'))
@@ -485,24 +531,46 @@ def export_part_studio(
 ) -> List[ExportResult]:
     """Export all parts from a Part Studio as DXFs.
     
-    Unsuppresses the 'Orient Plates for Export' feature, exports each part,
-    then re-suppresses the feature.
+    Two-phase export:
+    1. Export flat patterns directly (sheet metal, already oriented)
+    2. Export regular parts using 'Orient Plates for Export' feature
     
     Returns:
         List of (result_eid, filename) tuples for successful exports
     """
     eid = part_studio['id']
     name = part_studio['name']
-    results = []
+    results: List[ExportResult] = []
     
     logging.info(f"Processing Part Studio: {name}")
     
-    # Find orient feature
+    # Phase 1: Get all parts including flat patterns and categorize them
+    all_parts = list_parts(client, did, wid, eid, include_flat_parts=True)
+    flat_patterns, regular_parts = categorize_parts(all_parts)
+    
+    logging.info(f"Found {len(flat_patterns)} flat patterns, {len(regular_parts)} regular parts")
+    
+    # Export flat patterns directly (they're already correctly oriented)
+    for flat in flat_patterns:
+        flat_name = flat.get('name', 'unnamed_flat')
+        try:
+            result = export_part_as_dxf(client, did, wid, eid, flat)
+            if result:
+                results.append(result)
+                logging.info(f"Exported flat pattern '{flat_name}'")
+        except Exception as e:
+            logging.error(f"Failed to export flat pattern '{flat_name}': {e}")
+    
+    # Phase 2: Export regular parts using orient feature (if any exist)
+    if not regular_parts:
+        logging.info(f"No regular parts to export in {name}")
+        return results
+    
     features = get_features(client, did, wid, eid)
     orient_feature = find_orient_feature(features)
     
     if not orient_feature:
-        logging.info(f"No 'Orient Plates for Export' feature in {name}, skipping")
+        logging.warning(f"No 'Orient Plates for Export' feature in {name}, skipping {len(regular_parts)} regular parts")
         return results
     
     # Unsuppress feature
@@ -511,10 +579,10 @@ def export_part_studio(
     
     try:
         time.sleep(5)  # Allow Part Studio to regenerate
-        parts = list_parts(client, did, wid, eid)
-        logging.info(f"Found {len(parts)} parts in {name}")
+        # Re-fetch parts after orient feature is unsuppressed
+        oriented_parts = list_parts(client, did, wid, eid)
         
-        for part in parts:
+        for part in oriented_parts:
             part_name = part.get('name', 'unnamed_part')
             try:
                 result = export_part_as_dxf(client, did, wid, eid, part)
@@ -570,26 +638,42 @@ def package_results(
     results: List[ExportResult],
     output_dir: Path,
     log_entries: List[str]
-) -> Optional[Path]:
+) -> Tuple[Optional[Path], List[str]]:
     """Download exported files and package them into a ZIP.
     
+    Detects filename collisions and skips duplicates, collecting warnings.
+    
     Returns:
-        Path to ZIP file on success, None if no results
+        Tuple of (path to ZIP file or None, list of collision warnings)
     """
     if not results:
         logging.info("No files to package")
-        return None
+        return None, []
     
     logging.info(f"Downloading {len(results)} files...")
     
     zip_name = f"onshape_export_{int(time.time())}.zip"
     zip_path = output_dir / zip_name
     
+    seen_filenames: Dict[str, str] = {}  # filename -> first element_id
+    collision_warnings: List[str] = []
+    
     with zipfile.ZipFile(zip_path, 'w') as zf:
         for result_id, filename in results:
+            safe_name = filename.replace(' ', '_').replace('/', '_')
+            
+            # Check for filename collision
+            if safe_name in seen_filenames:
+                first_id = seen_filenames[safe_name]
+                warning = f"Filename collision: '{safe_name}' - kept element {first_id}, skipped element {result_id}"
+                collision_warnings.append(warning)
+                logging.warning(warning)
+                continue
+            
+            seen_filenames[safe_name] = result_id
+            
             try:
                 content = download_blob(client, did, wid, result_id)
-                safe_name = filename.replace(' ', '_').replace('/', '_')
                 zf.writestr(safe_name, content)
             except Exception as e:
                 logging.error(f"Failed to download {result_id}: {e}")
@@ -598,7 +682,7 @@ def package_results(
         zf.writestr("export_operation.log", "\n".join(log_entries))
     
     logging.info(f"Created ZIP: {zip_path}")
-    return zip_path
+    return zip_path, collision_warnings
 
 
 def run_export_workflow(
@@ -651,11 +735,20 @@ def run_export_workflow(
                 log(f"Exported: {result[1]}")
         
         # Step 5: Package
-        zip_path = package_results(client, did, wid, results, output_dir, log_entries)
+        zip_path, collision_warnings = package_results(client, did, wid, results, output_dir, log_entries)
         
         if zip_path:
             log(f"SUCCESS: {zip_path}")
             print(f"\n--- SUCCESS ---\nZIP file ready: {zip_path}\n")
+            
+            # Display collision warnings if any
+            if collision_warnings:
+                print("--- FILENAME COLLISIONS ---")
+                print("The following files had duplicate names. First occurrence was kept, others skipped:")
+                for warning in collision_warnings:
+                    print(f"  • {warning}")
+                print("\nPlease review your export rules to ensure unique filenames.\n")
+            
             return zip_path
         else:
             log("No files were exported")
