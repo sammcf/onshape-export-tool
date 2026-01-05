@@ -219,6 +219,94 @@ def categorize_parts(parts: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
     return flat_patterns, regular_parts
 
 
+def get_part_metadata(
+    client: OnshapeClient, did: str, wid: str, eid: str, part_id: str,
+    include_computed: bool = True
+) -> Dict[str, Any]:
+    """Get metadata for a specific part, optionally including computed properties."""
+    endpoint = f"/metadata/d/{did}/w/{wid}/e/{eid}/p/{part_id}"
+    params = {}
+    if include_computed:
+        params['includeComputedProperties'] = 'true'
+    return client.request('GET', endpoint, params=params)
+
+
+def get_part_bounding_box(
+    client: OnshapeClient, did: str, wid: str, eid: str, part_id: str
+) -> Dict[str, float]:
+    """Get bounding box for a specific part. Returns dict with lowX/Y/Z, highX/Y/Z."""
+    endpoint = f"/parts/d/{did}/w/{wid}/e/{eid}/partid/{part_id}/boundingboxes"
+    return client.request('GET', endpoint)
+
+
+def get_part_thickness(
+    client: OnshapeClient, did: str, wid: str, eid: str, part_id: str,
+    property_name: str = "Thickness"
+) -> Optional[float]:
+    """Get part thickness in mm.
+    
+    Tries two approaches:
+    1. Read computed property via metadata API
+    2. Fall back to bounding box Z-height (for oriented flat parts)
+    
+    Returns:
+        Thickness in mm, or None if unable to determine
+    """
+    # Approach 1: Try to read computed property
+    try:
+        metadata = get_part_metadata(client, did, wid, eid, part_id, include_computed=True)
+        properties = metadata.get('properties', [])
+        
+        for prop in properties:
+            if prop.get('name') == property_name or prop.get('propertyId', '').endswith(property_name):
+                value = prop.get('value')
+                if isinstance(value, dict):
+                    # Value with units: {"value": 3.0, "unitString": "mm"}
+                    raw_value = value.get('value', 0)
+                    unit = value.get('unitString', 'mm')
+                    # Convert to mm if needed
+                    if unit == 'm':
+                        return raw_value * 1000
+                    elif unit == 'in':
+                        return raw_value * 25.4
+                    return raw_value
+                elif isinstance(value, (int, float)):
+                    return float(value)
+        
+        logging.debug(f"Computed property '{property_name}' not found for part {part_id}")
+    except Exception as e:
+        logging.debug(f"Failed to get metadata for part {part_id}: {e}")
+    
+    # Approach 2: Fall back to bounding box Z-height
+    try:
+        bbox = get_part_bounding_box(client, did, wid, eid, part_id)
+        # For oriented flat parts, Z-height is thickness
+        # Bounding box values are in meters
+        z_height = abs(bbox.get('highZ', 0) - bbox.get('lowZ', 0))
+        thickness_mm = z_height * 1000  # Convert m to mm
+        
+        if thickness_mm > 0.01:  # Ignore near-zero values
+            logging.debug(f"Using bounding box Z-height for thickness: {thickness_mm:.2f}mm")
+            return thickness_mm
+    except Exception as e:
+        logging.debug(f"Failed to get bounding box for part {part_id}: {e}")
+    
+    return None
+
+
+def format_thickness_prefix(thickness_mm: Optional[float]) -> str:
+    """Format thickness as a filename prefix (e.g., '3.0mm_').
+    
+    Returns empty string if thickness is None or invalid.
+    """
+    if thickness_mm is None or thickness_mm <= 0:
+        return ""
+    
+    # Format to 1 decimal place, removing trailing zeros
+    formatted = f"{thickness_mm:.1f}".rstrip('0').rstrip('.')
+    return f"{formatted}mm"
+
+
 def update_feature_suppression(
     client: OnshapeClient, 
     did: str, 
@@ -485,6 +573,7 @@ def export_part_as_dxf(
     """Export a single part as DXF via temporary drawing.
     
     Creates a temp drawing, adds a top view, exports to DXF, then cleans up.
+    Prepends part thickness to filename if available.
     
     Returns:
         (result_element_id, filename) tuple on success, None on failure
@@ -503,14 +592,23 @@ def export_part_as_dxf(
         add_view_to_drawing(client, did, wid, temp_drawing_id, part_studio_eid, part_id)
         wait_for_microversion_change(client, did, wid, temp_drawing_id, old_mv)
         
+        # Get part thickness (computed property or bounding box fallback)
+        thickness = get_part_thickness(client, did, wid, part_studio_eid, part_id)
+        thickness_prefix = format_thickness_prefix(thickness)
+        if thickness:
+            logging.debug(f"Part '{part_name}' thickness: {thickness:.2f}mm")
+        
         # Export to DXF
         trans_id = initiate_translation(client, did, wid, temp_drawing_id, 'DXF', part_name)
         result_id, export_rule_filename = poll_translation(client, trans_id)
         
         # Use export rule filename if available, otherwise fall back to part name
-        filename = export_rule_filename or f"{part_name}.dxf"
-        if not filename.lower().endswith('.dxf'):
-            filename += '.dxf'
+        base_filename = export_rule_filename or f"{part_name}.dxf"
+        if not base_filename.lower().endswith('.dxf'):
+            base_filename += '.dxf'
+        
+        # Prepend thickness if available
+        filename = f"{thickness_prefix}{base_filename}"
         
         logging.info(f"Exported '{part_name}' → {result_id} ({filename})")
         return (result_id, filename)
