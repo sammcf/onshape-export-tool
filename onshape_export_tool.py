@@ -88,11 +88,110 @@ class Secrets(TypedDict):
     secret_key: str
 
 
+# Password cache for session (avoid repeated prompts)
+_cached_password: Optional[str] = None
+
+
+def derive_key(password: str, salt: bytes) -> bytes:
+    """PBKDF2 key derivation. 480k iterations per OWASP recommendation."""
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    import base64
+    
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=480000,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+
+
+def encrypt_secrets(secrets: Secrets, password: str) -> dict:
+    """Encrypt secrets, returning versioned storage dict."""
+    from cryptography.fernet import Fernet
+    import os
+    import base64
+    
+    salt = os.urandom(16)
+    key = derive_key(password, salt)
+    fernet = Fernet(key)
+    
+    plaintext = json.dumps({
+        'accessKey': secrets['access_key'],
+        'secretKey': secrets['secret_key']
+    }).encode()
+    
+    encrypted = fernet.encrypt(plaintext)
+    
+    return {
+        'version': 1,
+        'salt': base64.b64encode(salt).decode(),
+        'data': encrypted.decode()
+    }
+
+
+def decrypt_secrets(storage: dict, password: str) -> Secrets:
+    """Decrypt secrets from versioned storage dict."""
+    from cryptography.fernet import Fernet
+    import base64
+    
+    salt = base64.b64decode(storage['salt'])
+    key = derive_key(password, salt)
+    fernet = Fernet(key)
+    
+    decrypted = fernet.decrypt(storage['data'].encode())
+    data = json.loads(decrypted.decode())
+    
+    return Secrets(
+        access_key=data.get('accessKey') or data.get('access_key'),
+        secret_key=data.get('secretKey') or data.get('secret_key')
+    )
+
+
+def prompt_password(confirm: bool = False) -> str:
+    """Prompt for encryption password. With confirm=True, requires double entry."""
+    import getpass
+    
+    while True:
+        password = getpass.getpass("  Encryption password: ")
+        if not password:
+            print("  Password cannot be empty.")
+            continue
+        
+        if confirm:
+            password2 = getpass.getpass("  Confirm password: ")
+            if password != password2:
+                print("  Passwords do not match. Try again.")
+                continue
+        
+        return password
+
+
+def get_password(confirm: bool = False) -> str:
+    """Get password from cache or prompt user."""
+    global _cached_password
+    if _cached_password is None:
+        _cached_password = prompt_password(confirm=confirm)
+    return _cached_password
+
+
 def load_secrets(path: Path) -> Optional[Secrets]:
-    """Accepts both camelCase and snake_case key formats for flexibility."""
+    """Load secrets, handling both encrypted (v1) and plaintext (v0) formats."""
     try:
         with open(path, 'r') as f:
             data = json.load(f)
+        
+        # Check for encrypted format (v1)
+        if data.get('version') == 1:
+            password = get_password()
+            try:
+                return decrypt_secrets(data, password)
+            except Exception as e:
+                logging.error(f"Failed to decrypt secrets: {e}")
+                return None
+        
+        # Plaintext format (v0) - will be auto-migrated on next save
         access_key = data.get('accessKey') or data.get('access_key')
         secret_key = data.get('secretKey') or data.get('secret_key')
         if access_key and secret_key:
@@ -102,8 +201,18 @@ def load_secrets(path: Path) -> Optional[Secrets]:
         return None
 
 
+def save_secrets(secrets: Secrets, path: Path) -> None:
+    """Save secrets encrypted. Prompts for password if not cached."""
+    password = get_password(confirm=True)
+    encrypted = encrypt_secrets(secrets, password)
+    
+    with open(path, 'w') as f:
+        json.dump(encrypted, f, indent=2)
+    logging.info(f"Saved encrypted secrets to {path}")
+
+
 def prompt_secrets() -> Secrets:
-    """UnicodeDecodeError retry handles clipboard encoding issues when pasting."""
+    """Prompt for API credentials. Retries on clipboard encoding issues."""
     import getpass
     print("\n--- Onshape API Credentials ---")
     print("Enter your Onshape API keys (from Developer Portal):\n")
@@ -113,27 +222,16 @@ def prompt_secrets() -> Secrets:
             access_key = input("  Access Key: ").strip()
             break
         except UnicodeDecodeError:
-            print("  Error: Invalid characters detected. Please type or paste the key again.")
+            print("  Error: Invalid characters. Please try again.")
     
     while True:
         try:
             secret_key = getpass.getpass("  Secret Key: ").strip()
             break
         except UnicodeDecodeError:
-            print("  Error: Invalid characters detected. Please type or paste the key again.")
+            print("  Error: Invalid characters. Please try again.")
     
     return Secrets(access_key=access_key, secret_key=secret_key)
-
-
-def save_secrets(secrets: Secrets, path: Path) -> None:
-    """Save secrets to a JSON file."""
-    data = {
-        'accessKey': secrets['access_key'],
-        'secretKey': secrets['secret_key']
-    }
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
-    logging.info(f"Saved secrets to {path}")
 
 
 def get_or_prompt_secrets(path: Path) -> Secrets:

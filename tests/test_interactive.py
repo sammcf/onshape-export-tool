@@ -109,8 +109,13 @@ class TestGetOrPromptSecrets:
         assert result['access_key'] == "new_key"
     
     def test_offers_to_save(self, tmp_path, monkeypatch):
-        """User can opt to persist secrets for future runs."""
+        """User can opt to persist secrets (encrypted) for future runs."""
+        import onshape_export_tool
         secrets_file = tmp_path / ".secrets"
+        
+        # Mock password cache to avoid encryption password prompt
+        monkeypatch.setattr(onshape_export_tool, '_cached_password', 'testpass')
+        
         inputs = iter(["save_key", "save_secret", "y"])
         monkeypatch.setattr('builtins.input', lambda _: next(inputs))
         monkeypatch.setattr('getpass.getpass', lambda _: next(inputs))
@@ -118,5 +123,36 @@ class TestGetOrPromptSecrets:
         get_or_prompt_secrets(secrets_file)
         
         assert secrets_file.exists()
-        saved = load_secrets(secrets_file)
-        assert saved['access_key'] == "save_key"
+        # Verify it's encrypted (has version key)
+        import json
+        with open(secrets_file) as f:
+            data = json.load(f)
+        assert data.get('version') == 1
+        assert 'salt' in data
+        assert 'data' in data
+
+
+class TestEncryption:
+    """Tests for encryption round-trip."""
+    
+    def test_encrypt_decrypt_round_trip(self):
+        from onshape_export_tool import encrypt_secrets, decrypt_secrets, Secrets
+        
+        original = Secrets(access_key="test_access", secret_key="test_secret")
+        password = "mypassword"
+        
+        encrypted = encrypt_secrets(original, password)
+        decrypted = decrypt_secrets(encrypted, password)
+        
+        assert decrypted['access_key'] == original['access_key']
+        assert decrypted['secret_key'] == original['secret_key']
+    
+    def test_wrong_password_fails(self):
+        from onshape_export_tool import encrypt_secrets, decrypt_secrets, Secrets
+        from cryptography.fernet import InvalidToken
+        
+        original = Secrets(access_key="test", secret_key="secret")
+        encrypted = encrypt_secrets(original, "correctpass")
+        
+        with pytest.raises(InvalidToken):
+            decrypt_secrets(encrypted, "wrongpass")
