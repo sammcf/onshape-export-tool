@@ -144,6 +144,13 @@ class OnshapeClient:
             response = self.session.request(method, url, **kwargs)
             if response.status_code >= 400:
                 logging.error(f"Error {response.status_code}: {response.text}")
+                # Provide helpful hint for 404 errors on translation endpoints
+                if response.status_code == 404 and '/translations' in endpoint:
+                    logging.error(
+                        "HINT: A 404 on translation endpoints often indicates a missing export rule. "
+                        "Check that you have a valid export rule configured in Onshape for this "
+                        "element type (Part Studio DXF, Drawing PDF, etc.)."
+                    )
             response.raise_for_status()
             
             content_type = response.headers.get('Content-Type', '')
