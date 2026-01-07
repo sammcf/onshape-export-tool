@@ -4,11 +4,16 @@
 
 Onshape automation project for manufacturing artifact export. Two-part system:
 - **FeatureScripts**: Prepare geometry and compute metadata (plate orientation, thickness)
-- **Export CLI**: Python tool (`onshape_export_tool.py`) for API-driven batch export of DXFs and PDFs.
+- **Export CLI**: Python package (`onshape/`) with CLI entry point for API-driven batch export of DXFs and PDFs.
 
 **Current State**:
 - FeatureScripts are implemented.
-- Python CLI is fully functional (`onshape_export_tool.py`).
+- Python CLI is fully functional, organized as a modular package:
+  - `onshape/client.py`: OnshapeClient + API operations
+  - `onshape/secrets.py`: Credentials & encryption
+  - `onshape/ui.py`: Terminal UI primitives
+  - `onshape/workflow.py`: Export business logic
+  - `onshape/cli.py`: CLI entry point
   - Workflow: Unsuppress "Orient Plates" -> Create Temp Drawing -> Export DXF -> Delete Temp Drawing.
   - Supports exporting existing drawings to PDF.
   - Generates a timestamped ZIP file with all artifacts and a log file.
@@ -26,13 +31,24 @@ No formal build system. Testing requires manual verification in Onshape.
 # Install dependencies
 pip install -r requirements.txt
 
-# Run CLI (uses config file)
-python onshape_export_tool.py --verbose
+# Run CLI (interactive by default)
+python onshape_export_tool.py
 
-# CLI Args
-# --out <dir> : Specify output directory (default: exports)
-# --doc <id>  : Override document ID
-# --work <id> : Override workspace ID
+# Key CLI flags:
+# --setup              : Run guided setup wizard
+# --out <dir>          : Specify output directory (default: exports)
+# --doc-id <id>        : Document ID for non-interactive export
+# --workspace-id <id>  : Workspace ID for non-interactive export
+# --version-id <id>    : Version ID (read-only export)
+# --clean-before       : Delete existing DXF/PDFs before export
+# --clean-after        : Delete exports from document after packaging
+# --verbose            : Enable debug logging
+
+# Run tests
+pytest tests/ -v
+
+# Build executable
+./build.sh
 ```
 
 ---
@@ -213,32 +229,36 @@ if (transformCount > 0)
 
 ## Python Code Style Guidelines
 
-The `onshape_export_tool.py` follows these patterns:
+The `onshape/` package follows these patterns:
 
+### Module Structure
+| Module | Responsibility |
+|--------|---------------|
+| `client.py` | `OnshapeClient`, `DocContext`, all API operations, filename builders |
+| `secrets.py` | Encryption, credentials storage, document config |
+| `ui.py` | `print_header`, `interactive_menu`, `interactive_toggles`, wizards |
+| `workflow.py` | `run_export_workflow`, export functions, cleanup, `pipeline()` |
+| `cli.py` | Argument parsing, `main()`, `run_main_menu()` |
+
+### Code Patterns
 - **Type Hints**: Extensive use of `typing` (Dict, Any, List, Optional, cast).
+- **TypedDict**: `DocContext`, `Secrets`, `PartProperties`, `WorkflowState` for structured data.
 - **Configuration**: JSON-based config file (not committed).
 - **Logging**: Comprehensive logging to console and file.
-- **Workflow**:
-  1. **Pre-flight Cleanup**: Deletes `TEMP_` elements.
-  2. **Discovery**: Lists Part Studios and Drawings (including Application elements).
-  3. **Feature Logic**: Regex selection of highest-indexed "Orient Plates for Export" feature.
-  4. **Drawing Creation**: Creates empty ISO/mm drawing, adds 1:1 Top view, waits for microversion update.
-  5. **Export**: Translates to DXF (plates) or PDF (drawings), stores in document.
-  6. **Cleanup**: Deletes temporary drawings immediately.
-  7. **Packaging**: Downloads all exports to ZIP.
 
-Example structure:
+### Workflow Steps
+1. **Pre-flight Cleanup**: Deletes `TEMP_` elements.
+2. **Discovery**: Lists Part Studios and Drawings (including Application elements).
+3. **Feature Logic**: Regex selection of highest-indexed "Orient Plates for Export" feature.
+4. **Drawing Creation**: Creates empty ISO/mm drawing, adds 1:1 Top view, waits for microversion update.
+5. **Export**: Translates to DXF (plates) or PDF (drawings), stores in document.
+6. **Cleanup**: Deletes temporary drawings immediately.
+7. **Packaging**: Downloads all exports to ZIP.
+
+### Example Import
 ```python
-import logging
-from typing import Optional
-
-def poll_translation(client: OnshapeClient, translation_id: str, timeout: int = 300) -> Optional[str]:
-    """Poll until translation completes. Returns element_id or None."""
-    # Errors logged at source; callers check for None
-    result = poll_until(fetch, check_state, timeout)
-    if result is None or error_occurred[0]:
-        return None
-    return result
+from onshape import OnshapeClient, run_export_workflow, make_workspace_context
+from onshape.ui import interactive_menu, print_header
 ```
 
 ---
@@ -338,12 +358,13 @@ When adding or modifying API requests:
 - [DONE] **Handle Sheetmetal Parts Correctly**: Ensure that sheetmetal part flat patterns are exported correctly. This will probably require a change to the overall workflow: finding flat patterns and exporting them prior to unsuppressing the orient feature.
 - [DONE] **Handle Part Thickness for Export Rules**: Ensure that part thickness is used correctly in export rules. Given this is a computed property, we may need to radically change our strategy for handling it.
 - [DONE] **Packaged Script**: Use PyInstaller to package the script into a single executable file that can be run on any system with no other dependencies required.
-- [DONE] **Test Suite**: pytest-based test suite with pure function tests and mocked API tests (34 tests).
+- [DONE] **Test Suite**: pytest-based test suite with pure function tests and mocked API tests (58 tests).
 - [DONE] **Functional Refactor**: `DocContext` for workspace/version abstraction, `Secrets` for credentials, `pipeline()` for function composition, `WorkflowState` for immutable step flow.
 - [DONE] **Clean Run Option**: `--clean-before` deletes existing DXF/PDF blobs before export; `--clean-after` deletes them after packaging. Both flags are workspace-only (ignored for version exports).
 - [DONE] **Workspace vs. Version Parameterization**: `--version-id <id>` exports from an immutable document version instead of the active workspace.
 - [DONE] **Interactive Secrets Management**: `--setup` runs wizard; secrets stored in `.secrets`, document config in `config`. Prompts on first run.
-- [DONE] **Interactive Workflow**: `--interactive` lists recent documents, lets user select document → workspace/version → runs export.
+- [DONE] **Interactive Workflow**: Interactive mode is now the default. Main menu offers Export or Setup. Document selection includes toggleable options step.
+- [DONE] **Modular Package Structure**: Split monolithic script into `onshape/` package with focused modules (client, secrets, ui, workflow, cli).
 - [DONE] **Error Handling Standardization**: All fallible operations return `Optional[T]` with errors logged at source. Custom exceptions removed.
 - [DONE] **Function Consolidation**: `build_export_filename()`, `extract_properties_from_lookup()`, `execute_translation()` unify repeated patterns.
 - [DONE] **Simplified Thickness**: `get_part_thickness()` uses bounding box Z-height only (no computed property lookup).
