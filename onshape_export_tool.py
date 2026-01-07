@@ -646,8 +646,15 @@ def get_part_properties(
         else:
             missing.append('Revision')
         
-        if PROP_MATERIAL in prop_lookup and prop_lookup[PROP_MATERIAL]:
-            props['material'] = str(prop_lookup[PROP_MATERIAL])
+        # Material is a nested dict with displayName
+        material_val = prop_lookup.get(PROP_MATERIAL)
+        if material_val:
+            if isinstance(material_val, dict):
+                props['material'] = material_val.get('displayName', '')
+            else:
+                props['material'] = str(material_val)
+            if not props.get('material'):
+                missing.append('Material')
         else:
             missing.append('Material')
             
