@@ -17,9 +17,7 @@ from typing import Dict, Any, List, Optional, Tuple, Callable, TypeVar, cast
 from typing_extensions import TypedDict
 
 
-# ============================================================
-# SECTION 1: Configuration & Constants
-# ============================================================
+# --- Configuration & Constants ---
 
 API_BASE = "https://cad.onshape.com/api/v12"
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
@@ -39,9 +37,6 @@ PROP_MATERIAL = "57f3fb8efa3416c06701d615"
 # Type alias for export results: (element_id, filename)
 ExportResult = Tuple[str, str]
 
-# Type alias for translation results: (element_id, export_rule_filename or None)
-TranslationResult = Tuple[str, Optional[str]]
-
 
 def get_run_command() -> str:
     """Returns appropriate CLI command for frozen exe vs script mode."""
@@ -50,55 +45,42 @@ def get_run_command() -> str:
     return "python onshape_export_tool.py"
 
 
-# ============================================================
-# SECTION 1b: Document Context
-# ============================================================
-
 class DocContext(TypedDict):
-    """Onshape API paths use /d/{did}/{wvm_type}/{wvm_id}/... format.
-    This bundles those values, enabling workspace/version mode switching.
-    """
+    """Bundles document/workspace/version IDs for API path construction."""
     did: str
-    wvm_type: str  # 'w' = workspace (mutable), 'v' = version, 'm' = microversion
+    wvm_type: str  # 'w' = workspace, 'v' = version, 'm' = microversion
     wvm_id: str
 
 
 def doc_path(ctx: DocContext, suffix: str = "") -> str:
-    """Build document path segment: /d/{did}/{wvm_type}/{wvm_id}{suffix}"""
     return f"/d/{ctx['did']}/{ctx['wvm_type']}/{ctx['wvm_id']}{suffix}"
 
 
 def is_mutable(ctx: DocContext) -> bool:
-    """Check if context allows modifications (workspace only)."""
     return ctx['wvm_type'] == 'w'
 
 
-def make_context(did: str, wid: str) -> DocContext:
-    """Create a workspace context (convenience for migration)."""
+def make_workspace_context(did: str, wid: str) -> DocContext:
     return DocContext(did=did, wvm_type='w', wvm_id=wid)
 
 
 def make_version_context(did: str, vid: str) -> DocContext:
-    """Create a version context for read-only exports."""
     return DocContext(did=did, wvm_type='v', wvm_id=vid)
 
 
-# ============================================================
-# SECTION 1c: Secrets Management
-# ============================================================
+
+# --- Secrets Management ---
 
 class Secrets(TypedDict):
-    """API credentials for Onshape authentication."""
     access_key: str
     secret_key: str
 
 
-# Password cache for session (avoid repeated prompts)
 _cached_password: Optional[str] = None
 
 
 def derive_key(password: str, salt: bytes) -> bytes:
-    """PBKDF2 key derivation. 480k iterations per OWASP recommendation."""
+    """PBKDF2 key derivation, 480k iterations per OWASP."""
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from cryptography.hazmat.primitives import hashes
     import base64
@@ -113,7 +95,6 @@ def derive_key(password: str, salt: bytes) -> bytes:
 
 
 def encrypt_secrets(secrets: Secrets, password: str) -> dict:
-    """Encrypt secrets, returning versioned storage dict."""
     from cryptography.fernet import Fernet
     import os
     import base64
@@ -137,7 +118,6 @@ def encrypt_secrets(secrets: Secrets, password: str) -> dict:
 
 
 def decrypt_secrets(storage: dict, password: str) -> Secrets:
-    """Decrypt secrets from versioned storage dict."""
     from cryptography.fernet import Fernet
     import base64
     
@@ -155,7 +135,6 @@ def decrypt_secrets(storage: dict, password: str) -> Secrets:
 
 
 def prompt_password(confirm: bool = False) -> str:
-    """Prompt for encryption password. With confirm=True, requires double entry."""
     import getpass
     
     while True:
@@ -174,7 +153,6 @@ def prompt_password(confirm: bool = False) -> str:
 
 
 def get_password(confirm: bool = False) -> str:
-    """Get password from cache or prompt user."""
     global _cached_password
     if _cached_password is None:
         _cached_password = prompt_password(confirm=confirm)
@@ -182,7 +160,7 @@ def get_password(confirm: bool = False) -> str:
 
 
 def load_secrets(path: Path) -> Optional[Secrets]:
-    """Load secrets, handling both encrypted (v1) and plaintext (v0) formats."""
+    """Handles both encrypted (v1) and plaintext (v0) formats."""
     try:
         with open(path, 'r') as f:
             data = json.load(f)
@@ -207,7 +185,6 @@ def load_secrets(path: Path) -> Optional[Secrets]:
 
 
 def save_secrets(secrets: Secrets, path: Path) -> None:
-    """Save secrets encrypted. Prompts for password if not cached."""
     password = get_password(confirm=True)
     encrypted = encrypt_secrets(secrets, password)
     
@@ -218,7 +195,6 @@ def save_secrets(secrets: Secrets, path: Path) -> None:
 
 
 def prompt_secrets() -> Secrets:
-    """Prompt for API credentials. Retries on clipboard encoding issues."""
     import getpass
     print("\n--- Onshape API Credentials ---")
     print("Enter your Onshape API keys (from Developer Portal):\n")
@@ -241,7 +217,6 @@ def prompt_secrets() -> Secrets:
 
 
 def get_or_prompt_secrets(path: Path) -> Secrets:
-    """Load or prompt, offering to persist for future runs."""
     secrets = load_secrets(path)
     if secrets:
         return secrets
@@ -258,13 +233,12 @@ def get_or_prompt_secrets(path: Path) -> Secrets:
     return secrets
 
 
-# ============================================================
-# SECTION 1d: Interactive Utilities
-# ============================================================
+
+# --- Interactive Utilities ---
 
 def interactive_select(items: List[Dict[str, Any]], prompt: str, 
                        display_fn: Callable[[Dict[str, Any]], str]) -> Optional[Dict[str, Any]]:
-    """Numbered menu. Returns None on cancel (0) or empty list."""
+    """Numbered menu. Returns None on cancel or empty list."""
     if not items:
         print("No items available.")
         return None
@@ -290,7 +264,6 @@ def interactive_select(items: List[Dict[str, Any]], prompt: str,
 
 
 def prompt_document_config() -> Tuple[str, str]:
-    """Prompt user for document ID and workspace ID."""
     print("\n--- Document Configuration ---\n")
     print("You can find these IDs in the Onshape document URL:")
     print("  https://cad.onshape.com/documents/{documentId}/w/{workspaceId}/...\n")
@@ -301,7 +274,6 @@ def prompt_document_config() -> Tuple[str, str]:
 
 
 def save_document_config(did: str, wid: str, path: Path) -> None:
-    """Save document configuration to file."""
     data = {
         'documentId': did,
         'workspaceId': wid
@@ -312,7 +284,6 @@ def save_document_config(did: str, wid: str, path: Path) -> None:
 
 
 def load_document_config(path: Path) -> Optional[Tuple[str, str]]:
-    """Load document config from file. Returns (did, wid) or None."""
     try:
         with open(path, 'r') as f:
             data = json.load(f)
@@ -326,7 +297,6 @@ def load_document_config(path: Path) -> Optional[Tuple[str, str]]:
 
 
 def run_setup_wizard(secrets_path: Path, config_path: Path) -> None:
-    """Run interactive setup wizard for first-time configuration."""
     print("\n" + "="*60)
     print("    ONSHAPE EXPORT TOOL - SETUP WIZARD")
     print("="*60)
@@ -355,47 +325,20 @@ def run_setup_wizard(secrets_path: Path, config_path: Path) -> None:
     print(f"\nYou can now run exports with: {get_run_command()}")
 
 
-# ============================================================
-# SECTION 2: Custom Exceptions
-# ============================================================
 
-class TranslationError(Exception):
-    """Raised when a translation job fails."""
-    pass
-
-class ElementNotFoundError(Exception):
-    """Raised when an expected element disappears."""
-    pass
-
-
-# ============================================================
-# SECTION 3: Generic Utilities
-# ============================================================
+# --- Generic Utilities ---
 
 T = TypeVar('T')
 
 
-# ============================================================
-# SECTION 3a: Pipeline Composition Utilities
-# ============================================================
-
 def pipeline(*steps: Callable[[T], T]) -> Callable[[T], T]:
-    """Compose functions left-to-right: pipeline(f, g, h)(x) = h(g(f(x)))
-    
-    Each step receives the output of the previous step.
-    This enables functional workflow composition.
-    """
+    """Compose left-to-right: pipeline(f, g, h)(x) = h(g(f(x)))"""
     return lambda initial: reduce(lambda state, step: step(state), steps, initial)
 
 
 class WorkflowState(TypedDict, total=False):
-    """Immutable state passed between workflow steps.
-    
-    Each step returns a new state dict: {**state, 'key': new_value}
-    Using total=False allows optional keys.
-    """
-    # Bound dependencies (injected at start)
-    client: Any  # OnshapeClient
+    """Immutable state for pipeline. Each step returns {**state, 'key': new}."""
+    client: Any
     ctx: DocContext
     output_dir: Path
     # Workflow data (accumulated by steps)
@@ -409,7 +352,6 @@ class WorkflowState(TypedDict, total=False):
 
 
 def log_step(state: WorkflowState, msg: str) -> WorkflowState:
-    """Helper to add a log entry to state (pure function)."""
     entry = f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}"
     logging.info(msg)
     log_entries = state.get('log_entries', []).copy()
@@ -422,21 +364,22 @@ def poll_until(
     predicate: Callable[[Any], Optional[T]],
     timeout: int = 60,
     interval: float = 2.0
-) -> T:
-    """Poll until predicate returns non-None. Used for translation status checks."""
+) -> Optional[T]:
+    """Poll until predicate returns non-None."""
     start = time.time()
     while time.time() - start < timeout:
         data = fetch()
+        if data is None:
+            return None  # fetch failed, error already logged
         result = predicate(data)
         if result is not None:
             return result
         time.sleep(interval)
-    raise TimeoutError(f"Polling timed out after {timeout}s")
+    logging.error(f"Polling timed out after {timeout}s")
+    return None
 
 
-# ============================================================
-# SECTION 4: OnshapeClient (Transport Only)
-# ============================================================
+# --- OnshapeClient (Transport Only) ---
 
 class OnshapeClient:
     """HTTP transport only. Business logic is in standalone functions that accept client.
@@ -480,19 +423,16 @@ class OnshapeClient:
             raise
 
 
-# ============================================================
-# SECTION 5: API Operations (Standalone Functions)
-# ============================================================
+
+# --- API Operations ---
 
 def list_elements(client: OnshapeClient, ctx: DocContext) -> List[Dict[str, Any]]:
-    """List all elements (tabs) in a document."""
     endpoint = f"/documents{doc_path(ctx)}/elements"
     resp = client.request('GET', endpoint)
     return resp if isinstance(resp, list) else resp.get('elements', [])
 
 
 def get_features(client: OnshapeClient, ctx: DocContext, eid: str) -> List[Dict[str, Any]]:
-    """Get all features from a Part Studio."""
     endpoint = f"/partstudios{doc_path(ctx)}/e/{eid}/features"
     resp = client.request('GET', endpoint)
     return resp.get('features', [])
@@ -502,7 +442,6 @@ def list_parts(
     client: OnshapeClient, ctx: DocContext, eid: str,
     include_flat_parts: bool = False
 ) -> List[Dict[str, Any]]:
-    """List all parts in a Part Studio."""
     endpoint = f"/parts{doc_path(ctx)}/e/{eid}"
     params = {}
     if include_flat_parts:
@@ -511,10 +450,7 @@ def list_parts(
 
 
 def categorize_parts(parts: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Separate flat patterns from regular parts.
-    
-    Sheet metal flat patterns export directly; their parent parts are filtered out.
-    """
+    """Separate flat patterns (export directly) from regular parts."""
     flat_patterns = []
     regular_parts = []
     flat_part_originals = set()  # IDs of parts that have flat patterns
@@ -527,72 +463,36 @@ def categorize_parts(parts: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
         else:
             regular_parts.append(part)
     
-    # Filter out regular parts that are original sheet metal (they have flat patterns)
+    # Filter out original sheet metal parts (they have flat patterns)
     regular_parts = [p for p in regular_parts if p.get('partId') not in flat_part_originals]
     
     return flat_patterns, regular_parts
 
 
 def get_part_metadata(
-    client: OnshapeClient, ctx: DocContext, eid: str, part_id: str,
-    include_computed: bool = True
+    client: OnshapeClient, ctx: DocContext, eid: str, part_id: str
 ) -> Dict[str, Any]:
-    """Get metadata for a specific part, optionally including computed properties."""
     endpoint = f"/metadata{doc_path(ctx)}/e/{eid}/p/{part_id}"
-    params = {}
-    if include_computed:
-        params['includeComputedProperties'] = 'true'
-    return client.request('GET', endpoint, params=params)
+    return client.request('GET', endpoint)
 
 
 def get_part_bounding_box(
     client: OnshapeClient, ctx: DocContext, eid: str, part_id: str
 ) -> Dict[str, float]:
-    """Get bounding box for a specific part. Returns dict with lowX/Y/Z, highX/Y/Z."""
     endpoint = f"/parts{doc_path(ctx)}/e/{eid}/partid/{part_id}/boundingboxes"
     return client.request('GET', endpoint)
 
 
 def get_part_thickness(
-    client: OnshapeClient, ctx: DocContext, eid: str, part_id: str,
-    property_name: str = "Thickness"
+    client: OnshapeClient, ctx: DocContext, eid: str, part_id: str
 ) -> Optional[float]:
-    """Returns mm. Tries computed property first, falls back to bounding box Z-height."""
-    # Approach 1: Try to read computed property
-    try:
-        metadata = get_part_metadata(client, ctx, eid, part_id, include_computed=True)
-        properties = metadata.get('properties', [])
-        
-        for prop in properties:
-            if prop.get('name') == property_name or prop.get('propertyId', '').endswith(property_name):
-                value = prop.get('value')
-                if isinstance(value, dict):
-                    # Value with units: {"value": 3.0, "unitString": "mm"}
-                    raw_value = value.get('value', 0)
-                    unit = value.get('unitString', 'mm')
-                    # Convert to mm if needed
-                    if unit == 'm':
-                        return raw_value * 1000
-                    elif unit == 'in':
-                        return raw_value * 25.4
-                    return raw_value
-                elif isinstance(value, (int, float)):
-                    return float(value)
-        
-        logging.debug(f"Computed property '{property_name}' not found for part {part_id}")
-    except Exception as e:
-        logging.debug(f"Failed to get metadata for part {part_id}: {e}")
-    
-    # Approach 2: Fall back to bounding box Z-height
+    """Returns thickness in mm from bounding box Z-height. Assumes part is oriented face-normal parallel to z-axis."""
     try:
         bbox = get_part_bounding_box(client, ctx, eid, part_id)
-        # For oriented flat parts, Z-height is thickness
-        # Bounding box values are in meters
         z_height = abs(bbox.get('highZ', 0) - bbox.get('lowZ', 0))
-        thickness_mm = z_height * 1000  # Convert m to mm
+        thickness_mm = z_height * 1000  # Bounding box is in meters
         
-        if thickness_mm > 0.01:  # Ignore near-zero values
-            logging.debug(f"Using bounding box Z-height for thickness: {thickness_mm:.2f}mm")
+        if thickness_mm > 0.01:
             return thickness_mm
     except Exception as e:
         logging.debug(f"Failed to get bounding box for part {part_id}: {e}")
@@ -617,36 +517,28 @@ class PartProperties(TypedDict, total=False):
     material: str
 
 
-def get_part_properties(
-    client: OnshapeClient, ctx: DocContext, eid: str, part_id: str
+def extract_properties_from_lookup(
+    prop_lookup: Dict[str, Any],
+    include_material: bool = True
 ) -> Tuple[PartProperties, List[str]]:
-    """Fetch part properties for filename assembly.
-    
-    Returns:
-        Tuple of (properties dict, list of missing property names)
-    """
+    """Core extraction from property lookup dict. Returns (props, missing)."""
     props: PartProperties = {}
     missing: List[str] = []
     
-    try:
-        metadata = get_part_metadata(client, ctx, eid, part_id, include_computed=False)
-        properties = metadata.get('properties', [])
-        
-        # Build lookup by propertyId
-        prop_lookup = {p.get('propertyId'): p.get('value', '') for p in properties}
-        
-        # Extract required properties
-        if PROP_PART_NUMBER in prop_lookup and prop_lookup[PROP_PART_NUMBER]:
-            props['part_number'] = str(prop_lookup[PROP_PART_NUMBER])
-        else:
-            missing.append('Part Number')
-        
-        if PROP_REVISION in prop_lookup and prop_lookup[PROP_REVISION]:
-            props['revision'] = str(prop_lookup[PROP_REVISION])
-        else:
-            missing.append('Revision')
-        
-        # Material is a nested dict with displayName
+    # Part Number
+    if PROP_PART_NUMBER in prop_lookup and prop_lookup[PROP_PART_NUMBER]:
+        props['part_number'] = str(prop_lookup[PROP_PART_NUMBER])
+    else:
+        missing.append('Part Number')
+    
+    # Revision
+    if PROP_REVISION in prop_lookup and prop_lookup[PROP_REVISION]:
+        props['revision'] = str(prop_lookup[PROP_REVISION])
+    else:
+        missing.append('Revision')
+    
+    # Material (optional, for parts only)
+    if include_material:
         material_val = prop_lookup.get(PROP_MATERIAL)
         if material_val:
             if isinstance(material_val, dict):
@@ -657,12 +549,86 @@ def get_part_properties(
                 missing.append('Material')
         else:
             missing.append('Material')
+    
+    return props, missing
+
+
+def get_element_properties(
+    client: OnshapeClient, ctx: DocContext, eid: str
+) -> Tuple[PartProperties, List[str]]:
+    """Fetch properties from element metadata (no material)."""
+    try:
+        endpoint = f"/metadata{doc_path(ctx)}/e/{eid}"
+        metadata = client.request('GET', endpoint)
+        properties = metadata.get('properties', [])
+        
+        prop_lookup = {p.get('propertyId'): p.get('value', '') for p in properties}
+        return extract_properties_from_lookup(prop_lookup, include_material=False)
+        
+    except Exception as e:
+        logging.warning(f"Failed to get properties for element {eid}: {e}")
+        return {}, ['Part Number', 'Revision']
+
+
+def get_part_properties(
+    client: OnshapeClient, ctx: DocContext, eid: str, part_id: str
+) -> Tuple[PartProperties, List[str]]:
+    """Fetch properties from part metadata (includes material)."""
+    try:
+        metadata = get_part_metadata(client, ctx, eid, part_id)
+        properties = metadata.get('properties', [])
+        
+        prop_lookup = {p.get('propertyId'): p.get('value', '') for p in properties}
+        return extract_properties_from_lookup(prop_lookup, include_material=True)
             
     except Exception as e:
         logging.warning(f"Failed to get properties for part {part_id}: {e}")
-        missing = ['Part Number', 'Revision', 'Material']
+        return {}, ['Part Number', 'Revision', 'Material']
+
+
+class FilenameSchema(TypedDict, total=False):
+    include_thickness: bool
+    include_material: bool
+    extension: str
+
+
+def build_export_filename(
+    fallback_name: str,
+    props: PartProperties,
+    extension: str,
+    thickness_mm: Optional[float] = None,
+    include_material: bool = False
+) -> str:
+    """Build filename from properties with fallback to provided name."""
+    part_number = props.get('part_number', '')
+    revision = props.get('revision', '')
+    material = props.get('material', '') if include_material else ''
+    thickness_str = format_thickness_prefix(thickness_mm) if thickness_mm else ''
     
-    return props, missing
+    # Build filename if we have required properties
+    if part_number and revision:
+        parts = []
+        if thickness_str:
+            parts.append(thickness_str)
+        if material:
+            parts.append(material)
+        
+        # Core: partNumber_Rev revision
+        core = f"{part_number}_Rev {revision}"
+        
+        if parts:
+            prefix = ' '.join(parts)
+            return f"{prefix}_{core}.{extension}"
+        return f"{core}.{extension}"
+    
+    # Fallback: use provided name with optional thickness prefix
+    if thickness_str:
+        return f"{thickness_str}{fallback_name}.{extension}"
+    
+    # Ensure we don't double the extension
+    if fallback_name.lower().endswith(f'.{extension}'):
+        return fallback_name
+    return f"{fallback_name}.{extension}"
 
 
 def build_dxf_filename(
@@ -670,32 +636,25 @@ def build_dxf_filename(
     thickness_mm: Optional[float],
     props: PartProperties
 ) -> str:
-    """Build DXF filename: {thickness}mm {material}_{partNumber}_Rev {revision}.dxf"""
-    thickness_str = format_thickness_prefix(thickness_mm)
-    
-    part_number = props.get('part_number', '')
-    revision = props.get('revision', '')
-    material = props.get('material', '')
-    
-    # If we have all properties, use the full schema
-    if part_number and revision and material:
-        return f"{thickness_str} {material}_{part_number}_Rev {revision}.dxf"
-    
-    # Fallback: use part name with thickness prefix
-    return f"{thickness_str}{part_name}.dxf" if thickness_str else f"{part_name}.dxf"
+    """DXF: {thickness}mm {material}_{partNumber}_Rev {revision}.dxf"""
+    return build_export_filename(
+        fallback_name=part_name,
+        props=props,
+        extension='dxf',
+        thickness_mm=thickness_mm,
+        include_material=True
+    )
 
 
 def build_pdf_filename(name: str, props: PartProperties) -> str:
-    """Build PDF filename: {partNumber}_Rev {revision}.pdf"""
-    part_number = props.get('part_number', '')
-    revision = props.get('revision', '')
-    
-    # If we have required properties, use schema
-    if part_number and revision:
-        return f"{part_number}_Rev {revision}.pdf"
-    
-    # Fallback: use provided name
-    return f"{name}.pdf" if not name.lower().endswith('.pdf') else name
+    """PDF: {partNumber}_Rev {revision}.pdf"""
+    return build_export_filename(
+        fallback_name=name,
+        props=props,
+        extension='pdf',
+        thickness_mm=None,
+        include_material=False
+    )
 
 
 def update_feature_suppression(
@@ -705,7 +664,6 @@ def update_feature_suppression(
     feature: Dict[str, Any], 
     suppressed: bool
 ) -> None:
-    """Suppress or unsuppress a feature in a Part Studio."""
     feature_id = feature.get('featureId')
     feature_copy = json.loads(json.dumps(feature))
     feature_copy['suppressed'] = suppressed
@@ -720,14 +678,13 @@ def update_feature_suppression(
 
 
 def delete_element(client: OnshapeClient, ctx: DocContext, eid: str) -> None:
-    """Delete an element from the document."""
     endpoint = f"/elements{doc_path(ctx)}/e/{eid}"
     logging.info(f"Deleting element {eid}")
     client.request('DELETE', endpoint)
 
 
 def rename_element(client: OnshapeClient, ctx: DocContext, eid: str, new_name: str) -> None:
-    """Rename an element (tab) in the document to match the assembled filename."""
+    """Rename element to match assembled filename."""
     endpoint = f"/metadata{doc_path(ctx)}/e/{eid}"
     
     try:
@@ -844,7 +801,6 @@ def initiate_translation(
     format_name: str, 
     destination_name: str
 ) -> str:
-    """Start a translation (export) job. Returns the translation ID."""
     endpoint = f"/drawings{doc_path(ctx)}/e/{eid}/translations"
     payload = {
         "formatName": format_name,
@@ -864,27 +820,61 @@ def initiate_translation(
     return cast(str, resp.get('id'))
 
 
-def poll_translation(client: OnshapeClient, translation_id: str, timeout: int = 300) -> TranslationResult:
-    """Poll until translation completes. Returns (result_element_id, export_rule_filename)."""
+def poll_translation(client: OnshapeClient, translation_id: str, timeout: int = 300) -> Optional[str]:
+    """Poll until translation completes. Returns element_id or None."""
     endpoint = f"/translations/{translation_id}"
     
-    def fetch():
-        return client.request('GET', endpoint)
+    def fetch() -> Optional[Dict[str, Any]]:
+        try:
+            return client.request('GET', endpoint)
+        except Exception as e:
+            logging.error(f"Failed to poll translation {translation_id}: {e}")
+            return None
     
-    def check_state(resp):
+    error_occurred = [False]
+    
+    def check_state(resp: Dict[str, Any]) -> Optional[str]:
         state = resp.get('requestState')
         if state == 'DONE':
             ids = resp.get('resultElementIds', [])
             if ids:
-                export_rule_filename = resp.get('exportRuleFileName')  # May be None
-                return (ids[0], export_rule_filename)
-            raise TranslationError("Translation done but no result element IDs found")
+                return ids[0]
+            logging.error("Translation done but no result element IDs found")
+            error_occurred[0] = True
+            return '__ERROR__'
         elif state == 'FAILED':
-            raise TranslationError(f"Translation failed: {resp.get('failureReason', 'Unknown reason')}")
+            logging.error(f"Translation failed: {resp.get('failureReason', 'Unknown reason')}")
+            error_occurred[0] = True
+            return '__ERROR__'
         return None  # Keep polling
     
-    return poll_until(fetch, check_state, timeout)
+    result = poll_until(fetch, check_state, timeout)
+    if result is None or error_occurred[0]:
+        return None
+    return result
 
+
+def execute_translation(
+    client: OnshapeClient,
+    ctx: DocContext,
+    eid: str,
+    format_name: str,
+    destination_name: str,
+    final_filename: str
+) -> Optional[ExportResult]:
+    """Initiate → poll → rename. Returns (element_id, filename) or None."""
+    trans_id = initiate_translation(client, ctx, eid, format_name, destination_name)
+    if not trans_id:
+        logging.error(f"Failed to initiate {format_name} translation for element {eid}")
+        return None
+    
+    result_id = poll_translation(client, trans_id)
+    if result_id is None:
+        logging.error(f"{format_name} translation failed for element {eid}")
+        return None
+    
+    rename_element(client, ctx, result_id, final_filename)
+    return (result_id, final_filename)
 
 def wait_for_microversion_change(
     client: OnshapeClient, 
@@ -892,17 +882,23 @@ def wait_for_microversion_change(
     eid: str, 
     old_mv: Optional[str], 
     timeout: int = 60
-) -> str:
-    """Poll until an element's microversion changes. Returns the new microversion."""
+) -> Optional[str]:
+    """Poll until element microversion changes. Returns new mv or None."""
     logging.info(f"Waiting for element {eid} to update...")
     
-    def fetch():
-        elements = list_elements(client, ctx)
-        return next((e for e in elements if e['id'] == eid), None)
     
-    def check_microversion(element):
+    def fetch() -> Optional[Dict[str, Any]]:
+        try:
+            elements = list_elements(client, ctx)
+            return next((e for e in elements if e['id'] == eid), None)
+        except Exception as e:
+            logging.error(f"Failed to fetch elements: {e}")
+            return None
+    
+    def check_microversion(element: Optional[Dict[str, Any]]) -> Optional[str]:
         if element is None:
-            raise ElementNotFoundError(f"Element {eid} disappeared!")
+            logging.error(f"Element {eid} not found")
+            return '__NOT_FOUND__'  # Sentinel to stop polling
         new_mv = element.get('microversionId')
         if new_mv and new_mv != old_mv:
             logging.info(f"Element updated (MV: {new_mv})")
@@ -910,16 +906,21 @@ def wait_for_microversion_change(
         return None  # Keep polling
     
     result = poll_until(fetch, check_microversion, timeout)
+    if result is None or result == '__NOT_FOUND__':
+        return None
     # Small buffer for drawing app to finish internal rendering
     time.sleep(2)
     return result
 
 
-def download_blob(client: OnshapeClient, ctx: DocContext, eid: str) -> bytes:
-    """Download blob element content as bytes."""
+def download_blob(client: OnshapeClient, ctx: DocContext, eid: str) -> Optional[bytes]:
     endpoint = f"/blobelements{doc_path(ctx)}/e/{eid}"
     logging.debug(f"Downloading blob {eid}")
-    return cast(bytes, client.request('GET', endpoint))
+    try:
+        return cast(bytes, client.request('GET', endpoint))
+    except Exception as e:
+        logging.error(f"Failed to download blob {eid}: {e}")
+        return None
 
 
 def get_element_microversion(client: OnshapeClient, ctx: DocContext, eid: str) -> Optional[str]:
@@ -1015,7 +1016,7 @@ def run_interactive_workflow(client: OnshapeClient, output_dir: Path,
     
     # Step 3: Create context and run
     if choice['type'] == 'workspace':
-        ctx = make_context(did, choice['id'])
+        ctx = make_workspace_context(did, choice['id'])
         print(f"\nExporting from workspace: {choice['name']}")
     else:
         ctx = make_version_context(did, choice['id'])
@@ -1187,13 +1188,20 @@ def export_part_as_dxf(
     # Create temp drawing
     temp_name = f"TEMP_{part_name}_{int(time.time())}"
     temp_drawing_id = create_drawing(client, ctx, temp_name)
+    if not temp_drawing_id:
+        logging.error(f"Failed to create temp drawing for '{part_name}'")
+        return None
+    
     old_mv = get_element_microversion(client, ctx, temp_drawing_id)
     logging.info(f"Created temp drawing for '{part_name}'")
     
     try:
         # Add view and wait for it to render
         add_view_to_drawing(client, ctx, temp_drawing_id, part_studio_eid, part_id)
-        wait_for_microversion_change(client, ctx, temp_drawing_id, old_mv)
+        new_mv = wait_for_microversion_change(client, ctx, temp_drawing_id, old_mv)
+        if new_mv is None:
+            logging.error(f"Timed out waiting for view to render for '{part_name}'")
+            return None
         
         # Get part thickness from bounding box Z-height
         thickness = get_part_thickness(client, ctx, part_studio_eid, part_id)
@@ -1208,15 +1216,13 @@ def export_part_as_dxf(
         # Build filename from properties
         filename = build_dxf_filename(part_name, thickness, props)
         
-        # Export to DXF
-        trans_id = initiate_translation(client, ctx, temp_drawing_id, 'DXF', part_name)
-        result_id, _ = poll_translation(client, trans_id)
+        # Export to DXF using unified translation
+        result = execute_translation(client, ctx, temp_drawing_id, 'DXF', part_name, filename)
+        if result is None:
+            return None
         
-        # Rename the exported blob to match assembled filename
-        rename_element(client, ctx, result_id, filename)
-        
-        logging.info(f"Exported '{part_name}' → {result_id} ({filename})")
-        return (result_id, filename)
+        logging.info(f"Exported '{part_name}' → {result[0]} ({filename})")
+        return result
         
     finally:
         # Always clean up temp drawing
@@ -1316,70 +1322,35 @@ def export_drawing_as_pdf(
     
     logging.info(f"Processing drawing: {name}")
     
-    try:
-        # Get properties from the part referenced by this drawing
-        props: PartProperties = {}
-        missing: List[str] = []
+    # Get properties from the element referenced by this drawing
+    props: PartProperties = {}
+    missing: List[str] = ['Part Number', 'Revision']
+    
+    # Query drawing for referenced Part Studios/Assemblies
+    refs = get_drawing_references(client, ctx, eid)
+    
+    if refs:
+        ref = refs[0]
+        target_eid = ref.get('targetElementId')
         
-        try:
-            # Query drawing for referenced Part Studios/Assemblies
-            refs = get_drawing_references(client, ctx, eid)
-            
-            if refs:
-                # Get first unique targetElementId 
-                ref = refs[0]
-                target_eid = ref.get('targetElementId')
-                
-                if target_eid:
-                    # Try to get element metadata directly (works for Assemblies)
-                    try:
-                        endpoint = f"/metadata{doc_path(ctx)}/e/{target_eid}"
-                        metadata = client.request('GET', endpoint)
-                        properties = metadata.get('properties', [])
-                        prop_lookup = {p.get('propertyId'): p.get('value', '') for p in properties}
-                        
-                        if PROP_PART_NUMBER in prop_lookup and prop_lookup[PROP_PART_NUMBER]:
-                            props['part_number'] = str(prop_lookup[PROP_PART_NUMBER])
-                        else:
-                            missing.append('Part Number')
-                        
-                        if PROP_REVISION in prop_lookup and prop_lookup[PROP_REVISION]:
-                            props['revision'] = str(prop_lookup[PROP_REVISION])
-                        else:
-                            missing.append('Revision')
-                            
-                        if props:
-                            logging.debug(f"Drawing '{name}' got properties from element {target_eid}")
-                            
-                    except Exception as e:
-                        logging.debug(f"Failed to query element metadata: {e}")
-                        missing = ['Part Number', 'Revision']
-                else:
-                    missing = ['Part Number', 'Revision']
-            else:
-                missing = ['Part Number', 'Revision']
-                
-        except Exception as e:
-            logging.debug(f"Failed to get drawing references: {e}")
-            missing = ['Part Number', 'Revision']
-        
-        if missing:
-            logging.warning(f"Drawing '{name}' missing properties: {', '.join(missing)}")
-        
-        # Build filename from properties
-        filename = build_pdf_filename(name, props)
-        
-        trans_id = initiate_translation(client, ctx, eid, 'PDF', name)
-        result_id, _ = poll_translation(client, trans_id)
-        
-        # Rename the exported blob to match assembled filename
-        rename_element(client, ctx, result_id, filename)
-        
-        logging.info(f"Exported '{name}' → {result_id} ({filename})")
-        return (result_id, filename)
-    except Exception as e:
-        logging.error(f"Failed to export drawing '{name}': {e}")
+        if target_eid:
+            props, missing = get_element_properties(client, ctx, target_eid)
+            if props:
+                logging.debug(f"Drawing '{name}' got properties from element {target_eid}")
+    
+    if missing:
+        logging.warning(f"Drawing '{name}' missing properties: {', '.join(missing)}")
+    
+    # Build filename from properties
+    filename = build_pdf_filename(name, props)
+    
+    # Export to PDF using unified translation
+    result = execute_translation(client, ctx, eid, 'PDF', name, filename)
+    if result is None:
         return None
+    
+    logging.info(f"Exported '{name}' → {result[0]} ({filename})")
+    return result
 
 
 def package_results(
@@ -1422,11 +1393,11 @@ def package_results(
             
             seen_filenames[safe_name] = result_id
             
-            try:
-                content = download_blob(client, ctx, result_id)
-                zf.writestr(safe_name, content)
-            except Exception as e:
-                logging.error(f"Failed to download {result_id}: {e}")
+            content = download_blob(client, ctx, result_id)
+            if content is None:
+                logging.error(f"Failed to download {result_id}, skipping")
+                continue
+            zf.writestr(safe_name, content)
         
         # Include log
         zf.writestr("export_operation.log", "\n".join(log_entries))
@@ -1642,7 +1613,7 @@ def main():
         if args.clean_before or args.clean_after:
             logging.warning("--clean-before/--clean-after ignored: cannot modify immutable version")
     else:
-        ctx = make_context(did, wid)
+        ctx = make_workspace_context(did, wid)
     
     run_export_workflow(client, ctx, output_path, 
                         clean_before=args.clean_before, 

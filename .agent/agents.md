@@ -229,18 +229,16 @@ The `onshape_export_tool.py` follows these patterns:
 
 Example structure:
 ```python
-import requests
 import logging
+from typing import Optional
 
-def export_dxf(document_id: str, workspace_id: str) -> str:
-    """Export plates as DXF from specified document."""
-    try:
-        response = requests.post(url, auth=(access_key, secret_key))
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException as e:
-        logging.error(f"Export failed: {e}")
-        raise
+def poll_translation(client: OnshapeClient, translation_id: str, timeout: int = 300) -> Optional[str]:
+    """Poll until translation completes. Returns element_id or None."""
+    # Errors logged at source; callers check for None
+    result = poll_until(fetch, check_state, timeout)
+    if result is None or error_occurred[0]:
+        return None
+    return result
 ```
 
 ---
@@ -346,6 +344,9 @@ When adding or modifying API requests:
 - [DONE] **Workspace vs. Version Parameterization**: `--version-id <id>` exports from an immutable document version instead of the active workspace.
 - [DONE] **Interactive Secrets Management**: `--setup` runs wizard; secrets stored in `.secrets`, document config in `config`. Prompts on first run.
 - [DONE] **Interactive Workflow**: `--interactive` lists recent documents, lets user select document → workspace/version → runs export.
+- [DONE] **Error Handling Standardization**: All fallible operations return `Optional[T]` with errors logged at source. Custom exceptions removed.
+- [DONE] **Function Consolidation**: `build_export_filename()`, `extract_properties_from_lookup()`, `execute_translation()` unify repeated patterns.
+- [DONE] **Simplified Thickness**: `get_part_thickness()` uses bounding box Z-height only (no computed property lookup).
 - [SPECULATIVE] **Part Filtering and Orientation**: Investigate if it's possible to bring the plate part filtering and orientation logic over to the API side, or if it should stay as a FeatureScript in Onshape.
 
 ## Important Takeaways
@@ -353,3 +354,4 @@ When adding or modifying API requests:
 - The Onshape REST API is incredibly powerful. Having a local spec and testing setup with Bruno suggests a lot of future possibilities.
 - I erroneously assumed that computed properties would not be available over the wire but *they are* - you just have to query the appropriate metadata endpoint with the right parameters.
 - Lots of refactoring and tidying up opportunities. In fact, a rewrite in go-lang probably wouldn't go astray - this has given me a strong understanding of the data flow and processes. Maybe using the [Charm framework?](https://charm.land/)
+- The `Optional[T]` return pattern (log at source, return `None` on failure) simplifies caller code and prepares for a future `Either[Error, T]` pattern if richer error context is needed.

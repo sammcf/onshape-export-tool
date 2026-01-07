@@ -11,7 +11,7 @@ from onshape_export_tool import (
     format_thickness_prefix,
     doc_path,
     is_mutable,
-    make_context
+    make_workspace_context
 )
 
 
@@ -104,9 +104,9 @@ class TestIsMutable:
         assert is_mutable({'did': 'doc', 'wvm_type': 'm', 'wvm_id': 'mv'}) is False
 
 
-class TestMakeContext:
+class TestMakeWorkspaceContext:
     def test_creates_workspace_context(self):
-        ctx = make_context('doc123', 'ws456')
+        ctx = make_workspace_context('doc123', 'ws456')
         assert ctx['did'] == 'doc123'
         assert ctx['wvm_type'] == 'w'
         assert ctx['wvm_id'] == 'ws456'
