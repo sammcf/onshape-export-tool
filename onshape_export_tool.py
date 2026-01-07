@@ -726,6 +726,22 @@ def delete_element(client: OnshapeClient, ctx: DocContext, eid: str) -> None:
     client.request('DELETE', endpoint)
 
 
+def rename_element(client: OnshapeClient, ctx: DocContext, eid: str, new_name: str) -> None:
+    """Rename an element (tab) in the document to match the assembled filename."""
+    # The 'Name' property has a standard propertyId
+    endpoint = f"/metadata{doc_path(ctx)}/e/{eid}"
+    payload = {
+        "properties": [
+            {"propertyId": "57f3fb8efa3416c06701d61d", "value": new_name}
+        ]
+    }
+    logging.debug(f"Renaming element {eid} to '{new_name}'")
+    try:
+        client.request('POST', endpoint, json=payload)
+    except Exception as e:
+        logging.warning(f"Failed to rename element {eid}: {e}")
+
+
 def get_drawing_references(
     client: OnshapeClient, ctx: DocContext, drawing_eid: str
 ) -> List[Dict[str, Any]]:
@@ -1178,6 +1194,9 @@ def export_part_as_dxf(
         trans_id = initiate_translation(client, ctx, temp_drawing_id, 'DXF', part_name)
         result_id, _ = poll_translation(client, trans_id)
         
+        # Rename the exported blob to match assembled filename
+        rename_element(client, ctx, result_id, filename)
+        
         logging.info(f"Exported '{part_name}' → {result_id} ({filename})")
         return (result_id, filename)
         
@@ -1334,6 +1353,9 @@ def export_drawing_as_pdf(
         
         trans_id = initiate_translation(client, ctx, eid, 'PDF', name)
         result_id, _ = poll_translation(client, trans_id)
+        
+        # Rename the exported blob to match assembled filename
+        rename_element(client, ctx, result_id, filename)
         
         logging.info(f"Exported '{name}' → {result_id} ({filename})")
         return (result_id, filename)
