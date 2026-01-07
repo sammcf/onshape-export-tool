@@ -736,7 +736,13 @@ def get_drawing_references(
     endpoint = f"/appelements{doc_path(ctx)}/e/{drawing_eid}/references"
     try:
         resp = client.request('GET', endpoint)
-        return resp if isinstance(resp, list) else resp.get('references', [])
+        logging.debug(f"Drawing references response: {resp}")
+        if isinstance(resp, list):
+            return resp
+        elif isinstance(resp, dict):
+            # Try different possible response structures
+            return resp.get('referencedElements', resp.get('references', []))
+        return []
     except Exception as e:
         logging.debug(f"Failed to get drawing references: {e}")
         return []
@@ -1279,20 +1285,35 @@ def export_drawing_as_pdf(
         missing: List[str] = []
         
         try:
-            # Query drawing for referenced parts
+            # Query drawing for referenced Part Studios/Assemblies
             refs = get_drawing_references(client, ctx, eid)
             
             if refs:
-                # Use first reference (typically the main part)
+                # Get first unique targetElementId (Part Studio)
                 ref = refs[0]
-                ref_eid = ref.get('referenceElementId') or ref.get('elementId')
-                ref_part_id = ref.get('partId')
+                target_eid = ref.get('targetElementId')
                 
-                if ref_eid and ref_part_id:
-                    logging.debug(f"Drawing '{name}' references part {ref_part_id} in element {ref_eid}")
-                    props, missing = get_part_properties(client, ctx, ref_eid, ref_part_id)
+                if target_eid:
+                    # Query the Part Studio for its parts
+                    try:
+                        parts_endpoint = f"/parts{doc_path(ctx)}/e/{target_eid}"
+                        parts = client.request('GET', parts_endpoint)
+                        
+                        if parts and len(parts) > 0:
+                            # Use first part's properties
+                            first_part = parts[0]
+                            first_part_id = first_part.get('partId')
+                            if first_part_id:
+                                logging.debug(f"Drawing '{name}' references Part Studio {target_eid}, using part {first_part_id}")
+                                props, missing = get_part_properties(client, ctx, target_eid, first_part_id)
+                            else:
+                                missing = ['Part Number', 'Revision']
+                        else:
+                            missing = ['Part Number', 'Revision']
+                    except Exception as e:
+                        logging.debug(f"Failed to query Part Studio parts: {e}")
+                        missing = ['Part Number', 'Revision']
                 else:
-                    logging.debug(f"Drawing references: {refs}")
                     missing = ['Part Number', 'Revision']
             else:
                 missing = ['Part Number', 'Revision']
