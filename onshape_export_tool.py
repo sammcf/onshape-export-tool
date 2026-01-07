@@ -728,16 +728,34 @@ def delete_element(client: OnshapeClient, ctx: DocContext, eid: str) -> None:
 
 def rename_element(client: OnshapeClient, ctx: DocContext, eid: str, new_name: str) -> None:
     """Rename an element (tab) in the document to match the assembled filename."""
-    # The 'Name' property has a standard propertyId
     endpoint = f"/metadata{doc_path(ctx)}/e/{eid}"
-    payload = {
-        "properties": [
-            {"propertyId": "57f3fb8efa3416c06701d61d", "value": new_name}
-        ]
-    }
-    logging.debug(f"Renaming element {eid} to '{new_name}'")
+    
     try:
+        # First, get the element's metadata to find the Name propertyId
+        metadata = client.request('GET', endpoint)
+        properties = metadata.get('properties', [])
+        
+        # Find the Name property
+        name_prop_id = None
+        for prop in properties:
+            if prop.get('name') == 'Name':
+                name_prop_id = prop.get('propertyId')
+                break
+        
+        if not name_prop_id:
+            logging.warning(f"Could not find Name propertyId for element {eid}")
+            logging.debug(f"Available properties: {[p.get('name') for p in properties]}")
+            return
+        
+        # Update the name
+        payload = {
+            "properties": [
+                {"propertyId": name_prop_id, "value": new_name}
+            ]
+        }
+        logging.debug(f"Renaming element {eid} to '{new_name}' using propertyId {name_prop_id}")
         client.request('POST', endpoint, json=payload)
+        
     except Exception as e:
         logging.warning(f"Failed to rename element {eid}: {e}")
 
