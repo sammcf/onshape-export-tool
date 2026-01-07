@@ -1289,29 +1289,33 @@ def export_drawing_as_pdf(
             refs = get_drawing_references(client, ctx, eid)
             
             if refs:
-                # Get first unique targetElementId (Part Studio)
+                # Get first unique targetElementId 
                 ref = refs[0]
                 target_eid = ref.get('targetElementId')
                 
                 if target_eid:
-                    # Query the Part Studio for its parts
+                    # Try to get element metadata directly (works for Assemblies)
                     try:
-                        parts_endpoint = f"/parts{doc_path(ctx)}/e/{target_eid}"
-                        parts = client.request('GET', parts_endpoint)
+                        endpoint = f"/metadata{doc_path(ctx)}/e/{target_eid}"
+                        metadata = client.request('GET', endpoint)
+                        properties = metadata.get('properties', [])
+                        prop_lookup = {p.get('propertyId'): p.get('value', '') for p in properties}
                         
-                        if parts and len(parts) > 0:
-                            # Use first part's properties
-                            first_part = parts[0]
-                            first_part_id = first_part.get('partId')
-                            if first_part_id:
-                                logging.debug(f"Drawing '{name}' references Part Studio {target_eid}, using part {first_part_id}")
-                                props, missing = get_part_properties(client, ctx, target_eid, first_part_id)
-                            else:
-                                missing = ['Part Number', 'Revision']
+                        if PROP_PART_NUMBER in prop_lookup and prop_lookup[PROP_PART_NUMBER]:
+                            props['part_number'] = str(prop_lookup[PROP_PART_NUMBER])
                         else:
-                            missing = ['Part Number', 'Revision']
+                            missing.append('Part Number')
+                        
+                        if PROP_REVISION in prop_lookup and prop_lookup[PROP_REVISION]:
+                            props['revision'] = str(prop_lookup[PROP_REVISION])
+                        else:
+                            missing.append('Revision')
+                            
+                        if props:
+                            logging.debug(f"Drawing '{name}' got properties from element {target_eid}")
+                            
                     except Exception as e:
-                        logging.debug(f"Failed to query Part Studio parts: {e}")
+                        logging.debug(f"Failed to query element metadata: {e}")
                         missing = ['Part Number', 'Revision']
                 else:
                     missing = ['Part Number', 'Revision']
