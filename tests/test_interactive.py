@@ -5,13 +5,22 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from onshape_export_tool import (
+from onshape.secrets import (
+    Secrets,
     prompt_secrets,
-    prompt_document_config,
-    interactive_select,
     get_or_prompt_secrets,
     load_secrets,
+    encrypt_secrets,
+    decrypt_secrets,
 )
+from onshape.ui import (
+    interactive_select,
+    interactive_menu,
+    interactive_toggles,
+    print_header,
+    print_section,
+)
+from onshape.secrets import prompt_document_config
 
 
 class TestPromptSecrets:
@@ -110,11 +119,11 @@ class TestGetOrPromptSecrets:
     
     def test_offers_to_save(self, tmp_path, monkeypatch):
         """User can opt to persist secrets (encrypted) for future runs."""
-        import onshape_export_tool
+        import onshape.secrets as secrets_module
         secrets_file = tmp_path / ".secrets"
         
         # Mock password cache to avoid encryption password prompt
-        monkeypatch.setattr(onshape_export_tool, '_cached_password', 'testpass')
+        monkeypatch.setattr(secrets_module, '_cached_password', 'testpass')
         
         inputs = iter(["save_key", "save_secret", "y"])
         monkeypatch.setattr('builtins.input', lambda _: next(inputs))
@@ -136,8 +145,6 @@ class TestEncryption:
     """Tests for encryption round-trip."""
     
     def test_encrypt_decrypt_round_trip(self):
-        from onshape_export_tool import encrypt_secrets, decrypt_secrets, Secrets
-        
         original = Secrets(access_key="test_access", secret_key="test_secret")
         password = "mypassword"
         
@@ -148,7 +155,6 @@ class TestEncryption:
         assert decrypted['secret_key'] == original['secret_key']
     
     def test_wrong_password_fails(self):
-        from onshape_export_tool import encrypt_secrets, decrypt_secrets, Secrets
         from cryptography.fernet import InvalidToken
         
         original = Secrets(access_key="test", secret_key="secret")
@@ -156,3 +162,93 @@ class TestEncryption:
         
         with pytest.raises(InvalidToken):
             decrypt_secrets(encrypted, "wrongpass")
+
+
+class TestInteractiveMenu:
+    """Tests for the interactive_menu function."""
+    
+    def test_selects_option_by_number(self, monkeypatch, capsys):
+        monkeypatch.setattr('builtins.input', lambda _: "2")
+        
+        result = interactive_menu(["Option A", "Option B", "Option C"])
+        assert result == 1  # 0-indexed
+    
+    def test_returns_none_on_cancel(self, monkeypatch, capsys):
+        monkeypatch.setattr('builtins.input', lambda _: "0")
+        
+        assert interactive_menu(["Option A", "Option B"]) is None
+    
+    def test_displays_options_correctly(self, monkeypatch, capsys):
+        monkeypatch.setattr('builtins.input', lambda _: "1")
+        
+        interactive_menu(["First", "Second"], "Choose one:")
+        output = capsys.readouterr().out
+        assert "Choose one:" in output
+        assert "1. First" in output
+        assert "2. Second" in output
+        assert "0. Cancel" in output
+    
+    def test_reprompts_on_invalid_input(self, monkeypatch, capsys):
+        inputs = iter(["99", "abc", "1"])
+        monkeypatch.setattr('builtins.input', lambda _: next(inputs))
+        
+        result = interactive_menu(["Only option"])
+        assert result == 0
+
+
+class TestInteractiveToggles:
+    """Tests for the interactive_toggles function."""
+    
+    def test_toggles_option_on(self, monkeypatch, capsys):
+        inputs = iter(["1", ""])  # Toggle first, then continue
+        monkeypatch.setattr('builtins.input', lambda _: next(inputs))
+        
+        result = interactive_toggles({"Option A": False, "Option B": True})
+        assert result["Option A"] == True  # Toggled on
+        assert result["Option B"] == True  # Unchanged
+    
+    def test_toggles_option_off(self, monkeypatch, capsys):
+        inputs = iter(["2", ""])  # Toggle second, then continue
+        monkeypatch.setattr('builtins.input', lambda _: next(inputs))
+        
+        result = interactive_toggles({"Option A": False, "Option B": True})
+        assert result["Option A"] == False  # Unchanged
+        assert result["Option B"] == False  # Toggled off
+    
+    def test_empty_input_exits(self, monkeypatch, capsys):
+        monkeypatch.setattr('builtins.input', lambda _: "")
+        
+        result = interactive_toggles({"Test": False})
+        assert result["Test"] == False
+    
+    def test_displays_toggle_status(self, monkeypatch, capsys):
+        monkeypatch.setattr('builtins.input', lambda _: "")
+        
+        interactive_toggles({"Enabled": True, "Disabled": False})
+        output = capsys.readouterr().out
+        assert "[X] Enabled" in output
+        assert "[ ] Disabled" in output
+    
+    def test_multiple_toggles(self, monkeypatch, capsys):
+        inputs = iter(["1", "2", "1", ""])  # Toggle A, B, then A again
+        monkeypatch.setattr('builtins.input', lambda _: next(inputs))
+        
+        result = interactive_toggles({"A": False, "B": False})
+        assert result["A"] == False  # Toggled on then off
+        assert result["B"] == True  # Toggled on
+
+
+class TestPrintHelpers:
+    """Tests for print_header and print_section."""
+    
+    def test_print_header(self, capsys):
+        print_header("TEST HEADER")
+        output = capsys.readouterr().out
+        assert "TEST HEADER" in output
+        assert "=" in output
+    
+    def test_print_section(self, capsys):
+        print_section("Section Title")
+        output = capsys.readouterr().out
+        assert "Section Title" in output
+        assert "-" in output

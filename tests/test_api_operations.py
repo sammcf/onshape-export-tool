@@ -6,13 +6,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from onshape_export_tool import (
+from onshape.client import (
     list_elements,
     get_features,
     list_parts,
     delete_element,
-    cleanup_exports,
 )
+from onshape.workflow import cleanup_exports
 
 
 class TestListElements:

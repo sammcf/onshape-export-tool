@@ -5,14 +5,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from onshape_export_tool import (
+from onshape.client import (
     categorize_parts, 
-    find_orient_feature, 
     format_thickness_prefix,
     doc_path,
     is_mutable,
-    make_workspace_context
+    make_workspace_context,
+    make_version_context,
 )
+from onshape.workflow import find_orient_feature, pipeline
 
 
 class TestCategorizeParts:
@@ -114,29 +115,24 @@ class TestMakeWorkspaceContext:
 
 class TestMakeVersionContext:
     def test_creates_version_context(self):
-        from onshape_export_tool import make_version_context
         ctx = make_version_context('doc123', 'ver789')
         assert ctx['did'] == 'doc123'
         assert ctx['wvm_type'] == 'v'
         assert ctx['wvm_id'] == 'ver789'
     
     def test_version_context_is_not_mutable(self):
-        from onshape_export_tool import make_version_context
         ctx = make_version_context('doc', 'ver')
         assert is_mutable(ctx) is False
 
 
 class TestPipeline:
     def test_composes_left_to_right(self):
-        from onshape_export_tool import pipeline
         add_one = lambda x: x + 1
         double = lambda x: x * 2
         assert pipeline(add_one, double)(1) == 4  # (1+1)*2
     
     def test_single_function(self):
-        from onshape_export_tool import pipeline
         assert pipeline(lambda x: x + 1)(5) == 6
     
     def test_empty_pipeline(self):
-        from onshape_export_tool import pipeline
         assert pipeline()(42) == 42

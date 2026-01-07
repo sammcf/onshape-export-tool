@@ -21,8 +21,16 @@ echo "  OS: ${OS}"
 echo "  Architecture: ${ARCH}"
 echo ""
 
-# Run PyInstaller
-pyinstaller --onefile --name "${OUTPUT_NAME}" onshape_export_tool.py
+# Run PyInstaller with hidden imports for the onshape package
+pyinstaller --onefile \
+    --name "${OUTPUT_NAME}" \
+    --hidden-import=onshape \
+    --hidden-import=onshape.client \
+    --hidden-import=onshape.secrets \
+    --hidden-import=onshape.ui \
+    --hidden-import=onshape.workflow \
+    --hidden-import=onshape.cli \
+    onshape_export_tool.py
 
 echo ""
 echo "Build complete: dist/${OUTPUT_NAME}"
