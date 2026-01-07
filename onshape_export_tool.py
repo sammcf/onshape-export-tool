@@ -31,6 +31,11 @@ DEFAULT_TEMPLATE_ELEMENT = "149ce62208ba05ac0cee75e5"
 # Prefixes for temporary elements that should be cleaned up
 TEMP_ELEMENT_PREFIXES = ("TEMP_", "DEBUG_VIEW_", "TEST_MV_")
 
+# Onshape property IDs for metadata lookup
+PROP_PART_NUMBER = "57f3fb8efa3416c06701d60f"
+PROP_REVISION = "57f3fb8efa3416c06701d610"
+PROP_MATERIAL = "57f3fb8efa3416c06701d615"
+
 # Type alias for export results: (element_id, filename)
 ExportResult = Tuple[str, str]
 
@@ -605,6 +610,87 @@ def format_thickness_prefix(thickness_mm: Optional[float]) -> str:
     return f"{formatted}mm"
 
 
+class PartProperties(TypedDict, total=False):
+    """Properties fetched from Onshape metadata for filename assembly."""
+    part_number: str
+    revision: str
+    material: str
+
+
+def get_part_properties(
+    client: OnshapeClient, ctx: DocContext, eid: str, part_id: str
+) -> Tuple[PartProperties, List[str]]:
+    """Fetch part properties for filename assembly.
+    
+    Returns:
+        Tuple of (properties dict, list of missing property names)
+    """
+    props: PartProperties = {}
+    missing: List[str] = []
+    
+    try:
+        metadata = get_part_metadata(client, ctx, eid, part_id, include_computed=False)
+        properties = metadata.get('properties', [])
+        
+        # Build lookup by propertyId
+        prop_lookup = {p.get('propertyId'): p.get('value', '') for p in properties}
+        
+        # Extract required properties
+        if PROP_PART_NUMBER in prop_lookup and prop_lookup[PROP_PART_NUMBER]:
+            props['part_number'] = str(prop_lookup[PROP_PART_NUMBER])
+        else:
+            missing.append('Part Number')
+        
+        if PROP_REVISION in prop_lookup and prop_lookup[PROP_REVISION]:
+            props['revision'] = str(prop_lookup[PROP_REVISION])
+        else:
+            missing.append('Revision')
+        
+        if PROP_MATERIAL in prop_lookup and prop_lookup[PROP_MATERIAL]:
+            props['material'] = str(prop_lookup[PROP_MATERIAL])
+        else:
+            missing.append('Material')
+            
+    except Exception as e:
+        logging.warning(f"Failed to get properties for part {part_id}: {e}")
+        missing = ['Part Number', 'Revision', 'Material']
+    
+    return props, missing
+
+
+def build_dxf_filename(
+    part_name: str,
+    thickness_mm: Optional[float],
+    props: PartProperties
+) -> str:
+    """Build DXF filename: {thickness}mm {material}_{partNumber}_Rev {revision}.dxf"""
+    thickness_str = format_thickness_prefix(thickness_mm)
+    
+    part_number = props.get('part_number', '')
+    revision = props.get('revision', '')
+    material = props.get('material', '')
+    
+    # If we have all properties, use the full schema
+    if part_number and revision and material:
+        return f"{thickness_str} {material}_{part_number}_Rev {revision}.dxf"
+    
+    # Fallback: use part name with thickness prefix
+    return f"{thickness_str}{part_name}.dxf" if thickness_str else f"{part_name}.dxf"
+
+
+def build_pdf_filename(name: str, props: PartProperties) -> str:
+    """Build PDF filename: {partNumber}_Rev {revision}.pdf"""
+    part_number = props.get('part_number', '')
+    revision = props.get('revision', '')
+    
+    # If we have required properties, use schema
+    if part_number and revision:
+        return f"{part_number}_Rev {revision}.pdf"
+    
+    # Fallback: use provided name
+    return f"{name}.pdf" if not name.lower().endswith('.pdf') else name
+
+
 def update_feature_suppression(
     client: OnshapeClient, 
     ctx: DocContext,
@@ -1046,23 +1132,22 @@ def export_part_as_dxf(
         add_view_to_drawing(client, ctx, temp_drawing_id, part_studio_eid, part_id)
         wait_for_microversion_change(client, ctx, temp_drawing_id, old_mv)
         
-        # Get part thickness (computed property or bounding box fallback)
+        # Get part thickness from bounding box Z-height
         thickness = get_part_thickness(client, ctx, part_studio_eid, part_id)
-        thickness_prefix = format_thickness_prefix(thickness)
         if thickness:
             logging.debug(f"Part '{part_name}' thickness: {thickness:.2f}mm")
         
+        # Get part properties for filename
+        props, missing = get_part_properties(client, ctx, part_studio_eid, part_id)
+        if missing:
+            logging.warning(f"Part '{part_name}' missing properties: {', '.join(missing)}")
+        
+        # Build filename from properties
+        filename = build_dxf_filename(part_name, thickness, props)
+        
         # Export to DXF
         trans_id = initiate_translation(client, ctx, temp_drawing_id, 'DXF', part_name)
-        result_id, export_rule_filename = poll_translation(client, trans_id)
-        
-        # Use export rule filename if available, otherwise fall back to part name
-        base_filename = export_rule_filename or f"{part_name}.dxf"
-        if not base_filename.lower().endswith('.dxf'):
-            base_filename += '.dxf'
-        
-        # Prepend thickness if available
-        filename = f"{thickness_prefix}{base_filename}"
+        result_id, _ = poll_translation(client, trans_id)
         
         logging.info(f"Exported '{part_name}' → {result_id} ({filename})")
         return (result_id, filename)
@@ -1166,13 +1251,37 @@ def export_drawing_as_pdf(
     logging.info(f"Processing drawing: {name}")
     
     try:
-        trans_id = initiate_translation(client, ctx, eid, 'PDF', name)
-        result_id, export_rule_filename = poll_translation(client, trans_id)
+        # Get drawing element metadata for filename
+        props: PartProperties = {}
+        missing: List[str] = []
+        try:
+            endpoint = f"/metadata{doc_path(ctx)}/e/{eid}"
+            metadata = client.request('GET', endpoint)
+            properties = metadata.get('properties', [])
+            prop_lookup = {p.get('propertyId'): p.get('value', '') for p in properties}
+            
+            if PROP_PART_NUMBER in prop_lookup and prop_lookup[PROP_PART_NUMBER]:
+                props['part_number'] = str(prop_lookup[PROP_PART_NUMBER])
+            else:
+                missing.append('Part Number')
+            
+            if PROP_REVISION in prop_lookup and prop_lookup[PROP_REVISION]:
+                props['revision'] = str(prop_lookup[PROP_REVISION])
+            else:
+                missing.append('Revision')
+                
+        except Exception as e:
+            logging.debug(f"Failed to get drawing metadata: {e}")
+            missing = ['Part Number', 'Revision']
         
-        # Use export rule filename if available, otherwise fall back to drawing name
-        filename = export_rule_filename or f"{name}.pdf"
-        if not filename.lower().endswith('.pdf'):
-            filename += '.pdf'
+        if missing:
+            logging.warning(f"Drawing '{name}' missing properties: {', '.join(missing)}")
+        
+        # Build filename from properties
+        filename = build_pdf_filename(name, props)
+        
+        trans_id = initiate_translation(client, ctx, eid, 'PDF', name)
+        result_id, _ = poll_translation(client, trans_id)
         
         logging.info(f"Exported '{name}' → {result_id} ({filename})")
         return (result_id, filename)
