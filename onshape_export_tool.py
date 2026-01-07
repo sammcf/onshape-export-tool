@@ -726,6 +726,22 @@ def delete_element(client: OnshapeClient, ctx: DocContext, eid: str) -> None:
     client.request('DELETE', endpoint)
 
 
+def get_drawing_references(
+    client: OnshapeClient, ctx: DocContext, drawing_eid: str
+) -> List[Dict[str, Any]]:
+    """Get parts/assemblies referenced by a drawing.
+    
+    Returns list of reference dicts with elementId, partId, etc.
+    """
+    endpoint = f"/appelements{doc_path(ctx)}/e/{drawing_eid}/references"
+    try:
+        resp = client.request('GET', endpoint)
+        return resp if isinstance(resp, list) else resp.get('references', [])
+    except Exception as e:
+        logging.debug(f"Failed to get drawing references: {e}")
+        return []
+
+
 def create_drawing(client: OnshapeClient, ctx: DocContext, name: str) -> str:
     """Create an empty drawing. Returns the new element ID."""
     endpoint = f"/drawings{doc_path(ctx)}/create"
@@ -1258,27 +1274,31 @@ def export_drawing_as_pdf(
     logging.info(f"Processing drawing: {name}")
     
     try:
-        # Get drawing element metadata for filename
+        # Get properties from the part referenced by this drawing
         props: PartProperties = {}
         missing: List[str] = []
+        
         try:
-            endpoint = f"/metadata{doc_path(ctx)}/e/{eid}"
-            metadata = client.request('GET', endpoint)
-            properties = metadata.get('properties', [])
-            prop_lookup = {p.get('propertyId'): p.get('value', '') for p in properties}
+            # Query drawing for referenced parts
+            refs = get_drawing_references(client, ctx, eid)
             
-            if PROP_PART_NUMBER in prop_lookup and prop_lookup[PROP_PART_NUMBER]:
-                props['part_number'] = str(prop_lookup[PROP_PART_NUMBER])
+            if refs:
+                # Use first reference (typically the main part)
+                ref = refs[0]
+                ref_eid = ref.get('referenceElementId') or ref.get('elementId')
+                ref_part_id = ref.get('partId')
+                
+                if ref_eid and ref_part_id:
+                    logging.debug(f"Drawing '{name}' references part {ref_part_id} in element {ref_eid}")
+                    props, missing = get_part_properties(client, ctx, ref_eid, ref_part_id)
+                else:
+                    logging.debug(f"Drawing references: {refs}")
+                    missing = ['Part Number', 'Revision']
             else:
-                missing.append('Part Number')
-            
-            if PROP_REVISION in prop_lookup and prop_lookup[PROP_REVISION]:
-                props['revision'] = str(prop_lookup[PROP_REVISION])
-            else:
-                missing.append('Revision')
+                missing = ['Part Number', 'Revision']
                 
         except Exception as e:
-            logging.debug(f"Failed to get drawing metadata: {e}")
+            logging.debug(f"Failed to get drawing references: {e}")
             missing = ['Part Number', 'Revision']
         
         if missing:
